@@ -70,8 +70,8 @@ public sealed class FakeVelocityClient : IVelocityClient
         var records = new List<TransactionRecord>();
         var now = DateTime.UtcNow;
 
-        // Generate ~50 transactions per call, spread between sinceDate and now
-        int count = _rng.Next(30, 70);
+        // Generate ~100 transactions per call, spread between sinceDate and now
+        int count = _rng.Next(60, 140);
         for (int i = 0; i < count; i++)
         {
             var ticksRange = now.Ticks - sinceDate.Ticks;
@@ -80,6 +80,10 @@ public sealed class FakeVelocityClient : IVelocityClient
             var evt = EventTypes[_rng.Next(EventTypes.Length)];
             var personIdx = _rng.Next(FirstNames.Length);
             var readerIdx = _rng.Next(ReaderNames.Length);
+
+            // Door Forced Open (event 4) cannot have a person attached: by definition
+            // it fires when the door is opened without any badge read at the reader.
+            var hasPerson = evt.Code != 4;
 
             records.Add(new TransactionRecord
             {
@@ -101,8 +105,8 @@ public sealed class FakeVelocityClient : IVelocityClient
                 ReaderName = ReaderNames[readerIdx],
                 FromZone = 0,
                 ToZone = 1,
-                Uid1 = 1000 + personIdx,
-                Uid1Name = $"{FirstNames[personIdx]} {LastNames[personIdx]}",
+                Uid1 = hasPerson ? 1000 + personIdx : 0,
+                Uid1Name = hasPerson ? $"{FirstNames[personIdx]} {LastNames[personIdx]}" : null,
                 Uid2 = 0,
                 Uid2Name = null,
                 ServerID = 1,
@@ -127,6 +131,12 @@ public sealed class FakeVelocityClient : IVelocityClient
             bool acked = _rng.Next(2) == 0;
             bool cleared = acked && _rng.Next(2) == 0;
             var personIdx = _rng.Next(FirstNames.Length);
+            int eventId = _rng.Next(2) == 0 ? 4 : 5; // forced or held
+
+            // Forced-open alarms (event 4) cannot have a person attached — by definition
+            // they fire without a badge read. Held-open alarms (event 5) keep the person
+            // who badged in and then failed to close the door behind them.
+            var hasPerson = eventId != 4;
 
             records.Add(new AlarmRecord
             {
@@ -135,10 +145,10 @@ public sealed class FakeVelocityClient : IVelocityClient
                 DbDate = dt.AddMilliseconds(_rng.Next(0, 100)),
                 AkDate = acked ? dt.AddMinutes(_rng.Next(1, 60)) : null,
                 ClDate = cleared ? dt.AddMinutes(_rng.Next(60, 240)) : null,
-                EventId = _rng.Next(2) == 0 ? 4 : 5, // forced or held
+                EventId = eventId,
                 AlarmLevelPriority = _rng.Next(1, 5),
                 Status = (byte)(cleared ? 2 : acked ? 1 : 0),
-                Description = _rng.Next(2) == 0 ? "Door Forced Open" : "Door Held Open",
+                Description = eventId == 4 ? "Door Forced Open" : "Door Held Open",
                 PortAddr = 1,
                 DtAddr = 1,
                 XAddr = 0,
@@ -146,8 +156,8 @@ public sealed class FakeVelocityClient : IVelocityClient
                 AkOperator = acked ? "admin" : null,
                 ClOperator = cleared ? "admin" : null,
                 WorkstationName = "VELOCITY-WS1",
-                Uid1 = 1000 + personIdx,
-                Uid1Name = $"{FirstNames[personIdx]} {LastNames[personIdx]}",
+                Uid1 = hasPerson ? 1000 + personIdx : null,
+                Uid1Name = hasPerson ? $"{FirstNames[personIdx]} {LastNames[personIdx]}" : null,
                 Uid2 = null,
                 Uid2Name = null,
                 Parm1 = null,
@@ -204,6 +214,102 @@ public sealed class FakeVelocityClient : IVelocityClient
         }).ToList();
 
         return Task.FromResult(people);
+    }
+
+    // ── Authorization / clearance seed data ─────────────────────────────
+    // Five hand-picked clearances with a plausible mix. Reader mappings and
+    // person assignments are deterministic so tests can rely on specific IDs.
+
+    private static readonly (int Id, string Name, string Schedule, int[] ReaderIndices)[] ClearanceDefinitions =
+    [
+        // "All Hours" grants every reader — a few trusted employees get this.
+        (1, "All Hours", "24x7", Enumerable.Range(0, 10).ToArray()),
+
+        // "Business Hours" grants every reader during standard hours.
+        (2, "Business Hours", "Business Hours 8-18 M-F", Enumerable.Range(0, 10).ToArray()),
+
+        // "Executive Suite" grants the executive-suite reader only.
+        (3, "Executive Suite", "24x7", [5]),
+
+        // "Server Room" grants the server-room reader only.
+        (4, "Server Room", "24x7", [4]),
+
+        // "Parking Only" grants the two parking garage readers only.
+        (5, "Parking Only", "24x7", [6, 7]),
+    ];
+
+    public Task<List<ClearanceRecord>> GetClearancesAsync(CancellationToken ct = default)
+    {
+        var rows = ClearanceDefinitions.Select(c => new ClearanceRecord
+        {
+            Id = c.Id,
+            Name = c.Name,
+            ScheduleName = c.Schedule,
+            Active = true,
+        }).ToList();
+        return Task.FromResult(rows);
+    }
+
+    public Task<List<ReaderClearanceRecord>> GetReaderClearancesAsync(CancellationToken ct = default)
+    {
+        var rows = new List<ReaderClearanceRecord>();
+        foreach (var c in ClearanceDefinitions)
+            foreach (var rIdx in c.ReaderIndices)
+                rows.Add(new ReaderClearanceRecord
+                {
+                    ReaderId = rIdx + 1,     // readers are 1-indexed in GetReadersAsync
+                    ClearanceId = c.Id,
+                });
+        return Task.FromResult(rows);
+    }
+
+    public Task<List<PersonClearanceRecord>> GetPersonClearancesAsync(CancellationToken ct = default)
+    {
+        // Deterministic assignment: each person gets "Business Hours" + one of
+        // the specialty clearances based on index, plus person 0 gets "All Hours"
+        // as the super-user. Expiry is null (indefinite) to keep v1 simple.
+        // Using a separate RNG so other method calls don't perturb assignments.
+        var assignRng = new Random(1337);
+        var anchor = DateTime.UtcNow.AddDays(-30);
+        var rows = new List<PersonClearanceRecord>();
+
+        for (int i = 0; i < FirstNames.Length; i++)
+        {
+            var personId = 1000 + i;
+
+            // Everyone gets Business Hours.
+            rows.Add(new PersonClearanceRecord
+            {
+                PersonId = personId,
+                ClearanceId = 2,
+                GrantedAt = anchor,
+                ExpiresAt = null,
+            });
+
+            // Person 0 is the super-user with 24x7.
+            if (i == 0)
+            {
+                rows.Add(new PersonClearanceRecord
+                {
+                    PersonId = personId,
+                    ClearanceId = 1,
+                    GrantedAt = anchor,
+                    ExpiresAt = null,
+                });
+            }
+
+            // Sprinkle specialty clearances deterministically.
+            var specialty = assignRng.Next(3, 6);  // 3=Exec, 4=Server, 5=Parking
+            rows.Add(new PersonClearanceRecord
+            {
+                PersonId = personId,
+                ClearanceId = specialty,
+                GrantedAt = anchor,
+                ExpiresAt = null,
+            });
+        }
+
+        return Task.FromResult(rows);
     }
 
     public void Dispose() { _connected = false; }

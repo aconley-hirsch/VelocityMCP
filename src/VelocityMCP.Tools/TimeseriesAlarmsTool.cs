@@ -5,18 +5,18 @@ using VelocityMCP.Data;
 namespace VelocityMCP.Tools;
 
 [McpServerToolType]
-public sealed class TimeseriesEventsTool
+public sealed class TimeseriesAlarmsTool
 {
-    [McpServerTool(Name = "timeseries_events", Destructive = false, ReadOnly = true),
-     Description("Return a zero-filled time series of event counts bucketed by hour, day, week, or month. " +
-                 "Use this for trend questions like 'show me access traffic per hour for the last 24 hours', " +
-                 "'how did forced-open events trend across the week?', or " +
-                 "'daily badge-ins for the server room this month'. " +
-                 "Empty buckets are returned as zero so the caller sees a contiguous series. " +
-                 "Filters work the same as count_events — prefer `door_id` over `reader_names` for door-scoped filtering. " +
-                 "For a single grand total, use count_events; for top-N breakdowns by dimension, use aggregate_events. " +
-                 "Response includes bucket unit, points array, total_events, and the resolved time window.")]
-    public static string TimeseriesEvents(
+    [McpServerTool(Name = "timeseries_alarms", Destructive = false, ReadOnly = true),
+     Description("Return a zero-filled time series of alarm counts bucketed by hour, day, week, or month. " +
+                 "The alarm parity of timeseries_events. Use this for trend questions like " +
+                 "'alarms per hour for the last 24 hours', 'daily priority-1 alarm volume this month', " +
+                 "or 'how did unacked alarms trend across the week?'. " +
+                 "Empty buckets are zero-filled. Filters match count_alarms / aggregate_alarms: " +
+                 "event_id, alarm_level_priority, status, person_id, workstation_name. " +
+                 "For a single grand total use count_alarms; for top-N by dimension use aggregate_alarms; " +
+                 "for ack/clear lifecycle metrics use alarm_response_metrics.")]
+    public static string TimeseriesAlarms(
         DuckDbMirror mirror,
         [Description("Bucket unit: 'hour', 'day', 'week', or 'month'.")]
         string bucket,
@@ -24,18 +24,16 @@ public sealed class TimeseriesEventsTool
         string? since = null,
         [Description("End of time window (ISO 8601). Defaults to now.")]
         string? until = null,
-        [Description("Filter by event code. Use list_event_types to discover codes.")]
-        int? event_code = null,
-        [Description("Filter by logical door ID. Use find_doors to discover. The tool resolves to all of the door's readers automatically — preferred over reader_name/reader_names.")]
-        int? door_id = null,
-        [Description("Filter by a single exact reader name. Prefer `door_id` for door-scoped questions.")]
-        string? reader_name = null,
-        [Description("Filter by a list of exact reader names. Prefer `door_id` for door-scoped questions.")]
-        string[]? reader_names = null,
+        [Description("Filter by the Velocity event_id that triggered the alarm.")]
+        int? event_id = null,
+        [Description("Filter by alarm priority level (lower = more severe in Velocity convention).")]
+        int? alarm_level_priority = null,
+        [Description("Filter by alarm status code (e.g. 0=new, 1=acknowledged, 2=cleared).")]
+        int? status = null,
         [Description("Filter by person ID. Use find_people to discover. Same person_id type works across both transaction and alarm tools.")]
         long? person_id = null,
-        [Description("Filter by disposition code. Use list_dispositions to discover.")]
-        int? disposition = null)
+        [Description("Filter by exact workstation_name (operator console that received/handled the alarm).")]
+        string? workstation_name = null)
     {
         var untilDate = until != null ? DateTime.Parse(until).ToUniversalTime() : DateTime.UtcNow;
         var defaultSince = bucket.ToLowerInvariant() switch
@@ -48,9 +46,9 @@ public sealed class TimeseriesEventsTool
         };
         var sinceDate = since != null ? DateTime.Parse(since).ToUniversalTime() : defaultSince;
 
-        var result = mirror.GetTransactionTimeSeries(
+        var result = mirror.GetAlarmTimeSeries(
             bucket, sinceDate, untilDate,
-            event_code, reader_name, reader_names, person_id, disposition, door_id);
+            event_id, alarm_level_priority, status, person_id, workstation_name);
 
         var fullCount = result.Points.Count;
         return ResponseShaper.SerializeWithCap(n => new

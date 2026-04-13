@@ -15,19 +15,22 @@ public sealed class IngestWorker : BackgroundService
     private readonly ILogger<IngestWorker> _logger;
     private readonly TimeSpan _interval;
     private readonly TimeSpan _backfillHorizon;
+    private readonly int _bulkBackfillCalls;
 
     public IngestWorker(
         IVelocityClient sdk,
         DuckDbMirror mirror,
         ILogger<IngestWorker> logger,
         TimeSpan? interval = null,
-        TimeSpan? backfillHorizon = null)
+        TimeSpan? backfillHorizon = null,
+        int bulkBackfillCalls = 1)
     {
         _sdk = sdk;
         _mirror = mirror;
         _logger = logger;
         _interval = interval ?? TimeSpan.FromSeconds(30);
         _backfillHorizon = backfillHorizon ?? TimeSpan.FromDays(7);
+        _bulkBackfillCalls = Math.Max(1, bulkBackfillCalls);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -68,6 +71,17 @@ public sealed class IngestWorker : BackgroundService
 
             var people = await _sdk.GetPersonsAsync(ct);
             _mirror.UpsertPeople(people);
+
+            // Authorization / policy dimensions. These are small (hundreds of rows
+            // at most) and change slowly — same refresh cadence as the rest.
+            var clearances = await _sdk.GetClearancesAsync(ct);
+            _mirror.UpsertClearances(clearances);
+
+            var readerClearances = await _sdk.GetReaderClearancesAsync(ct);
+            _mirror.UpsertReaderClearances(readerClearances);
+
+            var personClearances = await _sdk.GetPersonClearancesAsync(ct);
+            _mirror.UpsertPersonClearances(personClearances);
         }
         catch (Exception ex)
         {
@@ -82,6 +96,12 @@ public sealed class IngestWorker : BackgroundService
         {
             _logger.LogInformation("{Table}: existing cursor at {Cursor}, skipping backfill",
                 sourceTable, existingCursor.Value);
+            return;
+        }
+
+        if (_bulkBackfillCalls > 1)
+        {
+            await BulkBackfill(sourceTable, ct);
             return;
         }
 
@@ -136,6 +156,69 @@ public sealed class IngestWorker : BackgroundService
         // Set initial cursor to now
         _mirror.UpdateCursor(sourceTable, DateTime.UtcNow, totalRows);
         _logger.LogInformation("{Table}: backfill complete. {TotalRows} rows ingested", sourceTable, totalRows);
+    }
+
+    // One-shot cold-start seed path for the fake SDK. Calls the client N times with
+    // the full horizon window; because the fake client mints unique keys on every
+    // call, each batch adds fresh rows instead of colliding. For the real SDK this
+    // path is bypassed (_bulkBackfillCalls defaults to 1), so no duplicate fetches.
+    private async Task BulkBackfill(string sourceTable, CancellationToken ct)
+    {
+        var horizon = DateTime.UtcNow - _backfillHorizon;
+        _logger.LogInformation("{Table}: no cursor, bulk seeding {Calls} batches from {Horizon}",
+            sourceTable, _bulkBackfillCalls, horizon);
+
+        var sinceDate = horizon.AddMilliseconds(-1);
+        long totalRows = 0;
+        DateTime maxDt = horizon;
+
+        for (int batch = 0; batch < _bulkBackfillCalls && !ct.IsCancellationRequested; batch++)
+        {
+            try
+            {
+                int count = 0;
+
+                if (sourceTable == "Log_Transactions")
+                {
+                    var records = await _sdk.GetLogTransactionsAsync(sinceDate, ct);
+                    if (records.Count > 0)
+                    {
+                        _mirror.IngestTransactions(records);
+                        count = records.Count;
+                        var batchMax = records.Max(r => r.DtDate);
+                        if (batchMax > maxDt) maxDt = batchMax;
+                    }
+                }
+                else if (sourceTable == "AlarmLog")
+                {
+                    var records = await _sdk.GetAlarmLogAsync(sinceDate, ct);
+                    if (records.Count > 0)
+                    {
+                        _mirror.IngestAlarms(records);
+                        count = records.Count;
+                        var dated = records.Where(r => r.DtDate.HasValue).ToList();
+                        if (dated.Count > 0)
+                        {
+                            var batchMax = dated.Max(r => r.DtDate!.Value);
+                            if (batchMax > maxDt) maxDt = batchMax;
+                        }
+                    }
+                }
+
+                totalRows += count;
+                _logger.LogDebug("{Table}: bulk batch {Batch}/{Total}: {Count} rows",
+                    sourceTable, batch + 1, _bulkBackfillCalls, count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "{Table}: bulk batch {Batch} failed, continuing",
+                    sourceTable, batch + 1);
+            }
+        }
+
+        _mirror.UpdateCursor(sourceTable, DateTime.UtcNow, totalRows);
+        _logger.LogInformation("{Table}: bulk backfill complete. {TotalRows} rows ingested",
+            sourceTable, totalRows);
     }
 
     private async Task IngestCycle(CancellationToken ct)

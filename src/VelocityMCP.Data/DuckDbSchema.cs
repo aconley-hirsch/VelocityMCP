@@ -322,6 +322,40 @@ public sealed class DuckDbSchema
                 active          BOOLEAN DEFAULT TRUE,
                 updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            -- Authorization / policy dimension.
+            -- dim_clearances: named groupings (Velocity calls them "access levels")
+            --   schedule_name is informational in v1 (e.g. "24x7", "Business Hours 8-18 M-F");
+            --   proper time-schedule enforcement is deferred to when real Velocity is wired up.
+            CREATE TABLE IF NOT EXISTS dim_clearances (
+                clearance_id    INTEGER PRIMARY KEY,
+                name            VARCHAR NOT NULL,
+                schedule_name   VARCHAR,
+                active          BOOLEAN DEFAULT TRUE,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Which readers a clearance grants access to.
+            CREATE TABLE IF NOT EXISTS dim_reader_clearances (
+                reader_id       INTEGER NOT NULL,
+                clearance_id    INTEGER NOT NULL,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (reader_id, clearance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_rc_clearance ON dim_reader_clearances(clearance_id);
+
+            -- Which clearances a person currently holds.
+            -- expires_at NULL means indefinite. Filter on (expires_at IS NULL OR expires_at > now())
+            -- to get "currently active" assignments.
+            CREATE TABLE IF NOT EXISTS dim_person_clearances (
+                person_id       INTEGER NOT NULL,
+                clearance_id    INTEGER NOT NULL,
+                granted_at      TIMESTAMP NOT NULL,
+                expires_at      TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (person_id, clearance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pc_clearance ON dim_person_clearances(clearance_id);
             """;
         cmd.ExecuteNonQuery();
     }

@@ -47,12 +47,20 @@ void RegisterServices(IServiceCollection services, IConfiguration config)
             "Real VelocityAdapter SDK requires Windows x64. Set Velocity:UseFake=true for development.");
     }
 
+    // Fake SDK mints unique LogIds per call, so we can amass ~3k transactions
+    // in one shot on cold start by calling it 30 times. Real SDK would just
+    // refetch the same rows, so it stays at 1.
+    var bulkBackfillCalls = useFakeClient
+        ? (int.TryParse(config["Ingest:BulkBackfillCalls"], out var b) ? b : 30)
+        : 1;
+
     services.AddHostedService(sp => new IngestWorker(
         sp.GetRequiredService<IVelocityClient>(),
         sp.GetRequiredService<DuckDbMirror>(),
         sp.GetRequiredService<ILogger<IngestWorker>>(),
         interval: TimeSpan.FromSeconds(int.TryParse(config["Ingest:IntervalSeconds"], out var i) ? i : 30),
-        backfillHorizon: TimeSpan.FromDays(int.TryParse(config["Ingest:BackfillDays"], out var d) ? d : 7)
+        backfillHorizon: TimeSpan.FromDays(int.TryParse(config["Ingest:BackfillDays"], out var d) ? d : 7),
+        bulkBackfillCalls: bulkBackfillCalls
     ));
 }
 
@@ -74,7 +82,17 @@ IMcpServerBuilder AddMcpTools(IMcpServerBuilder mcpBuilder)
         .WithTools<GetAlarmTool>()
         .WithTools<CountAlarmsTool>()
         .WithTools<AggregateAlarmsTool>()
-        .WithTools<SampleAlarmsTool>();
+        .WithTools<SampleAlarmsTool>()
+        .WithTools<AlarmResponseMetricsTool>()
+        .WithTools<TimeseriesAlarmsTool>()
+        .WithTools<PersonDossierTool>()
+        .WithTools<DoorDossierTool>()
+        .WithTools<GetSurroundingEventsTool>()
+        .WithTools<DailySecurityBriefingTool>()
+        .WithTools<GetDailyAttendanceTool>()
+        .WithTools<FindForcedThroughAttemptsTool>()
+        .WithTools<CheckAuthorizationTool>()
+        .WithTools<InactiveEntitiesTool>();
 }
 
 // ── HTTP/SSE mode ───────────────────────────────────────────────────

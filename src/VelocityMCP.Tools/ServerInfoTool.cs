@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Text.Json;
 using ModelContextProtocol.Server;
 
 namespace VelocityMCP.Tools;
@@ -23,6 +22,6 @@ public sealed class ServerInfoTool
             server_version = "0.1.0-dev"
         };
 
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(result);
     }
 }

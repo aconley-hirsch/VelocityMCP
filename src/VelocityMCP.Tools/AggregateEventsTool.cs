@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Text.Json;
 using ModelContextProtocol.Server;
 using VelocityMCP.Data;
 
@@ -15,12 +14,14 @@ public sealed class AggregateEventsTool
                  "or 'how many distinct people used the side office' (use total_groups for that). " +
                  "Response includes total_events (grand total), total_groups (distinct values), " +
                  "truncated flag, and the resolved time window. " +
-                 "Supported group_by values: person, door, type, hour, day. " +
-                 "Filters work the same as count_events. " +
+                 "Supported group_by values: person, door, reader, type, hour, day. " +
+                 "IMPORTANT: 'door' collapses multi-reader doors into one row per logical door (preferred for 'busiest doors' questions). " +
+                 "'reader' groups by individual physical reader (use only when reader-level granularity matters). " +
+                 "Filters work the same as count_events — prefer `door_id` over `reader_names` for door-scoped filtering. " +
                  "For a single count with no breakdown, use count_events instead.")]
     public static string AggregateEvents(
         DuckDbMirror mirror,
-        [Description("Dimension to group by: 'person', 'door', 'type', 'hour', or 'day'.")]
+        [Description("Dimension to group by: 'person', 'door' (logical, collapses multi-reader doors), 'reader' (physical), 'type', 'hour', or 'day'.")]
         string group_by,
         [Description("Start of time window (ISO 8601). Defaults to 24 hours ago.")]
         string? since = null,
@@ -28,12 +29,14 @@ public sealed class AggregateEventsTool
         string? until = null,
         [Description("Filter by event code. Use list_event_types to discover codes.")]
         int? event_code = null,
-        [Description("Filter by a single exact reader name. Prefer `reader_names` for multi-reader doors.")]
+        [Description("Filter by logical door ID. Use find_doors to discover. The tool resolves to all of the door's readers automatically — preferred over reader_name/reader_names.")]
+        int? door_id = null,
+        [Description("Filter by a single exact reader name. Prefer `door_id` for door-scoped questions.")]
         string? reader_name = null,
-        [Description("Filter by a list of exact reader names. Use this with find_doors output to filter by a logical door that has multiple readers.")]
+        [Description("Filter by a list of exact reader names. Prefer `door_id` for door-scoped questions.")]
         string[]? reader_names = null,
-        [Description("Filter by person ID. Use find_people to discover.")]
-        int? person_id = null,
+        [Description("Filter by person ID. Use find_people to discover. Same person_id type works across both transaction and alarm tools.")]
+        long? person_id = null,
         [Description("Filter by disposition code. Use list_dispositions to discover.")]
         int? disposition = null,
         [Description("Maximum number of groups to return. Defaults to 10, max 50.")]
@@ -46,12 +49,13 @@ public sealed class AggregateEventsTool
         var result = mirror.AggregateTransactions(
             group_by, sinceDate, untilDate,
             event_code, reader_name, reader_names, person_id, disposition,
-            effectiveLimit);
+            effectiveLimit, door_id);
 
-        var payload = new
+        var fullCount = result.Groups.Count;
+        return ResponseShaper.SerializeWithCap(n => new
         {
             group_by = result.GroupBy,
-            groups = result.Groups.Select(g => new
+            groups = result.Groups.Take(n).Select(g => new
             {
                 key = g.Key,
                 key_id = g.KeyId,
@@ -59,7 +63,8 @@ public sealed class AggregateEventsTool
             }),
             total_events = result.TotalEvents,
             total_groups = result.TotalGroups,
-            truncated = result.Truncated,
+            truncated = result.Truncated || n < fullCount,
+            truncated_due_to_size = n < fullCount,
             window_used = new
             {
                 since = sinceDate.ToString("o"),
@@ -67,8 +72,6 @@ public sealed class AggregateEventsTool
                 defaulted_since = since == null,
                 defaulted_until = until == null
             }
-        };
-
-        return JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+        }, fullCount);
     }
 }

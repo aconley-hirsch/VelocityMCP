@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Text.Json;
 using ModelContextProtocol.Server;
 using VelocityMCP.Data;
 
@@ -33,7 +32,7 @@ public sealed class CountAlarmsTool
         int? alarm_level_priority = null,
         [Description("Filter by alarm status code (e.g. 0=new, 1=acknowledged, 2=cleared — verify against your Velocity policy).")]
         int? status = null,
-        [Description("Filter by person ID (uid1). Use find_people to discover. Note: uid1 is a double in fact_alarms.")]
+        [Description("Filter by person ID. Use find_people to discover. Same person_id type works across both transaction and alarm tools.")]
         long? person_id = null,
         [Description("Filter by exact workstation_name (operator console that received/handled the alarm).")]
         string? workstation_name = null)
@@ -57,7 +56,7 @@ public sealed class CountAlarmsTool
             }
         };
 
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(result);
     }
 }
 
@@ -88,7 +87,7 @@ public sealed class AggregateAlarmsTool
         int? alarm_level_priority = null,
         [Description("Filter by alarm status code.")]
         int? status = null,
-        [Description("Filter by person ID (uid1).")]
+        [Description("Filter by person ID. Use find_people to discover. Same person_id type works across both transaction and alarm tools.")]
         long? person_id = null,
         [Description("Filter by exact workstation_name.")]
         string? workstation_name = null,
@@ -104,10 +103,11 @@ public sealed class AggregateAlarmsTool
             event_id, alarm_level_priority, status, person_id, workstation_name,
             effectiveLimit);
 
-        var payload = new
+        var fullCount = result.Groups.Count;
+        return ResponseShaper.SerializeWithCap(n => new
         {
             group_by = result.GroupBy,
-            groups = result.Groups.Select(g => new
+            groups = result.Groups.Take(n).Select(g => new
             {
                 key = g.Key,
                 key_id = g.KeyId,
@@ -115,7 +115,8 @@ public sealed class AggregateAlarmsTool
             }),
             total_events = result.TotalEvents,
             total_groups = result.TotalGroups,
-            truncated = result.Truncated,
+            truncated = result.Truncated || n < fullCount,
+            truncated_due_to_size = n < fullCount,
             window_used = new
             {
                 since = sinceDate.ToString("o"),
@@ -123,9 +124,7 @@ public sealed class AggregateAlarmsTool
                 defaulted_since = since == null,
                 defaulted_until = until == null
             }
-        };
-
-        return JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+        }, fullCount);
     }
 }
 
@@ -155,7 +154,7 @@ public sealed class SampleAlarmsTool
         int? alarm_level_priority = null,
         [Description("Filter by alarm status code.")]
         int? status = null,
-        [Description("Filter by person ID (uid1).")]
+        [Description("Filter by person ID. Use find_people to discover. Same person_id type works across both transaction and alarm tools.")]
         long? person_id = null,
         [Description("Filter by exact workstation_name.")]
         string? workstation_name = null,
@@ -174,9 +173,10 @@ public sealed class SampleAlarmsTool
             event_id, alarm_level_priority, status, person_id, workstation_name,
             effectiveOrder, effectiveLimit);
 
-        var payload = new
+        var fullCount = result.Alarms.Count;
+        return ResponseShaper.SerializeWithCap(n => new
         {
-            alarms = result.Alarms.Select(a => new
+            alarms = result.Alarms.Take(n).Select(a => new
             {
                 alarm_id = a.AlarmId,
                 time = a.DtDate?.ToString("o"),
@@ -190,9 +190,10 @@ public sealed class SampleAlarmsTool
                 person_name = a.PersonName,
                 workstation_name = a.WorkstationName
             }),
-            returned = result.Alarms.Count,
+            returned = n,
             total_matching = result.TotalMatching,
-            truncated = result.Truncated,
+            truncated = result.Truncated || n < fullCount,
+            truncated_due_to_size = n < fullCount,
             order = effectiveOrder,
             window_used = new
             {
@@ -201,8 +202,6 @@ public sealed class SampleAlarmsTool
                 defaulted_since = since == null,
                 defaulted_until = until == null
             }
-        };
-
-        return JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+        }, fullCount);
     }
 }

@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Text.Json;
 using ModelContextProtocol.Server;
 using VelocityMCP.Data;
 
@@ -28,7 +27,7 @@ public sealed class ListEventTypesTool
             }),
             total = rows.Count
         };
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(result);
     }
 }
 
@@ -51,7 +50,7 @@ public sealed class ListDispositionsTool
             }),
             total = rows.Count
         };
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(result);
     }
 }
 
@@ -78,6 +77,6 @@ public sealed class LookupAlarmCategoriesTool
             }),
             total = rows.Count
         };
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(result);
     }
 }

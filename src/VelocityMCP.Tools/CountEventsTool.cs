@@ -1,6 +1,4 @@
 using System.ComponentModel;
-using System.ComponentModel.DataAnnotations;
-using System.Text.Json;
 using ModelContextProtocol.Server;
 using VelocityMCP.Data;
 
@@ -14,8 +12,8 @@ public sealed class CountEventsTool
                  "Use this for questions like 'how many transactions in the last hour?' or " +
                  "'how many times was the front door forced open this week?'. " +
                  "For breakdowns by dimension (person, door, type), use aggregate_events instead. " +
-                 "When filtering by door, pass all its reader names via `reader_names` (not the door name) — " +
-                 "find_doors returns the reader list you need.")]
+                 "PREFERRED door filter: pass `door_id` from find_doors and the tool will resolve the reader list for you. " +
+                 "Only fall back to `reader_name` / `reader_names` if you need to filter on individual readers.")]
     public static string CountEvents(
         DuckDbMirror mirror,
         [Description("Start of time window (ISO 8601). Defaults to 24 hours ago if omitted.")]
@@ -24,12 +22,14 @@ public sealed class CountEventsTool
         string? until = null,
         [Description("Filter by event code (e.g. 4 = Door Forced Open). Use list_event_types to discover codes.")]
         int? event_code = null,
-        [Description("Filter by a single exact reader name. Prefer `reader_names` if you have the list from find_doors.")]
+        [Description("Filter by logical door ID. Use find_doors to discover. The tool resolves to all of the door's readers automatically — preferred over reader_name/reader_names.")]
+        int? door_id = null,
+        [Description("Filter by a single exact reader name. Prefer `door_id` for door-scoped questions; use this only for individual reader filtering.")]
         string? reader_name = null,
-        [Description("Filter by a list of exact reader names — matches any of them. Use this when find_doors returns multiple readers for a single logical door (e.g. entry + exit).")]
+        [Description("Filter by a list of exact reader names — matches any of them. Prefer `door_id` for door-scoped questions.")]
         string[]? reader_names = null,
-        [Description("Filter by person ID (UID1). Use find_people to look up IDs.")]
-        int? person_id = null,
+        [Description("Filter by person ID (UID1). Use find_people to look up IDs. Same person_id type works across both transaction and alarm tools.")]
+        long? person_id = null,
         [Description("Filter by disposition (1 = Granted, 2 = Denied, etc.). Use list_dispositions to see values.")]
         int? disposition = null)
     {
@@ -38,7 +38,7 @@ public sealed class CountEventsTool
 
         var count = mirror.CountTransactions(
             sinceDate, untilDate, event_code, reader_name, reader_names,
-            person_id, disposition);
+            person_id, disposition, door_id);
 
         var result = new
         {
@@ -52,6 +52,6 @@ public sealed class CountEventsTool
             }
         };
 
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(result);
     }
 }

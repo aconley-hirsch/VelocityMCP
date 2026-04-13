@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Text.Json;
 using ModelContextProtocol.Server;
 using VelocityMCP.Data;
 
@@ -23,9 +22,7 @@ public sealed class GetEventTool
         var detail = mirror.GetTransaction(log_id);
         if (detail == null)
         {
-            return JsonSerializer.Serialize(
-                new { found = false, log_id },
-                new JsonSerializerOptions { WriteIndented = true });
+            return ResponseShaper.Serialize(new { found = false, log_id });
         }
 
         var payload = new
@@ -53,7 +50,7 @@ public sealed class GetEventTool
             uid2_name = detail.Uid2Name
         };
 
-        return JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(payload);
     }
 }
 
@@ -73,9 +70,7 @@ public sealed class GetAlarmTool
         var detail = mirror.GetAlarm(alarm_id);
         if (detail == null)
         {
-            return JsonSerializer.Serialize(
-                new { found = false, alarm_id },
-                new JsonSerializerOptions { WriteIndented = true });
+            return ResponseShaper.Serialize(new { found = false, alarm_id });
         }
 
         var payload = new
@@ -100,6 +95,6 @@ public sealed class GetAlarmTool
             parm2 = detail.Parm2
         };
 
-        return JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(payload);
     }
 }

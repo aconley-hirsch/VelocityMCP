@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Text.Json;
 using ModelContextProtocol.Server;
 using VelocityMCP.Data;
 
@@ -41,7 +40,7 @@ public sealed class FindDoorsTool
             total = matches.Count,
             truncated = matches.Count == effectiveLimit
         };
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(result);
     }
 }
 
@@ -74,7 +73,7 @@ public sealed class FindReadersTool
             total = matches.Count,
             truncated = matches.Count == effectiveLimit
         };
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(result);
     }
 }
 
@@ -110,6 +109,6 @@ public sealed class FindPeopleTool
             total = matches.Count,
             truncated = matches.Count == effectiveLimit
         };
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        return ResponseShaper.Serialize(result);
     }
 }
