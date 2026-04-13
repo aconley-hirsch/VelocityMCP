@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/VelocityMCP.Data/VelocityMCP.Data.csproj" />
+    <Project Path="src/VelocityMCP.Tools/VelocityMCP.Tools.csproj" />
+    <Project Path="src/VelocityMCP/VelocityMCP.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/VelocityMCP.Tests/VelocityMCP.Tests.csproj" />
+  </Folder>
+</Solution>

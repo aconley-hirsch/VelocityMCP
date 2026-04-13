@@ -1,0 +1,200 @@
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+namespace VelocityMCP.Data;
+
+/// <summary>
+/// Background service that polls the Velocity SDK for new log data and ingests it
+/// into the DuckDB mirror. Runs on a configurable interval (default 30s).
+/// On first run against an empty mirror, performs a bounded backfill (default 7 days).
+/// </summary>
+public sealed class IngestWorker : BackgroundService
+{
+    private readonly IVelocityClient _sdk;
+    private readonly DuckDbMirror _mirror;
+    private readonly ILogger<IngestWorker> _logger;
+    private readonly TimeSpan _interval;
+    private readonly TimeSpan _backfillHorizon;
+
+    public IngestWorker(
+        IVelocityClient sdk,
+        DuckDbMirror mirror,
+        ILogger<IngestWorker> logger,
+        TimeSpan? interval = null,
+        TimeSpan? backfillHorizon = null)
+    {
+        _sdk = sdk;
+        _mirror = mirror;
+        _logger = logger;
+        _interval = interval ?? TimeSpan.FromSeconds(30);
+        _backfillHorizon = backfillHorizon ?? TimeSpan.FromDays(7);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("Ingest worker starting. Interval: {Interval}s, Backfill horizon: {Horizon} days",
+            _interval.TotalSeconds, _backfillHorizon.TotalDays);
+
+        if (!_sdk.IsConnected)
+        {
+            await _sdk.ConnectAsync(stoppingToken);
+            _logger.LogInformation("SDK connected");
+        }
+
+        // Refresh dimension tables at startup (and periodically in future phases)
+        await RefreshDimensions(stoppingToken);
+
+        // Backfill if no cursor exists
+        await BackfillIfNeeded("Log_Transactions", stoppingToken);
+        await BackfillIfNeeded("AlarmLog", stoppingToken);
+
+        // Incremental ingest loop
+        using var timer = new PeriodicTimer(_interval);
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            await IngestCycle(stoppingToken);
+        }
+    }
+
+    private async Task RefreshDimensions(CancellationToken ct)
+    {
+        try
+        {
+            var doors = await _sdk.GetDoorsAsync(ct);
+            _mirror.UpsertDoors(doors);
+
+            var readers = await _sdk.GetReadersAsync(ct);
+            _mirror.UpsertReaders(readers);
+
+            var people = await _sdk.GetPersonsAsync(ct);
+            _mirror.UpsertPeople(people);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Dimension refresh failed");
+        }
+    }
+
+    private async Task BackfillIfNeeded(string sourceTable, CancellationToken ct)
+    {
+        var existingCursor = _mirror.GetCursor(sourceTable);
+        if (existingCursor.HasValue)
+        {
+            _logger.LogInformation("{Table}: existing cursor at {Cursor}, skipping backfill",
+                sourceTable, existingCursor.Value);
+            return;
+        }
+
+        var horizon = DateTime.UtcNow - _backfillHorizon;
+        _logger.LogInformation("{Table}: no cursor found, backfilling from {Horizon}",
+            sourceTable, horizon);
+
+        // Walk backwards in daily chunks from today to horizon
+        var chunkEnd = DateTime.UtcNow;
+        var totalRows = 0L;
+
+        while (chunkEnd > horizon && !ct.IsCancellationRequested)
+        {
+            var chunkStart = chunkEnd.AddDays(-1);
+            if (chunkStart < horizon) chunkStart = horizon;
+
+            try
+            {
+                // SDK uses strict > so subtract 1ms to include boundary
+                var sinceDate = chunkStart.AddMilliseconds(-1);
+                int count = 0;
+
+                if (sourceTable == "Log_Transactions")
+                {
+                    var records = await _sdk.GetLogTransactionsAsync(sinceDate, ct);
+                    // Filter to only the chunk window to avoid overlap
+                    var inWindow = records.Where(r => r.DtDate >= chunkStart && r.DtDate < chunkEnd).ToList();
+                    _mirror.IngestTransactions(inWindow);
+                    count = inWindow.Count;
+                }
+                else if (sourceTable == "AlarmLog")
+                {
+                    var records = await _sdk.GetAlarmLogAsync(sinceDate, ct);
+                    var inWindow = records.Where(r => r.DtDate.HasValue && r.DtDate.Value >= chunkStart && r.DtDate.Value < chunkEnd).ToList();
+                    _mirror.IngestAlarms(inWindow);
+                    count = inWindow.Count;
+                }
+
+                totalRows += count;
+                _logger.LogDebug("{Table}: backfill chunk {Start:d} → {End:d}: {Count} rows",
+                    sourceTable, chunkStart, chunkEnd, count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "{Table}: backfill chunk {Start:d} → {End:d} failed, continuing",
+                    sourceTable, chunkStart, chunkEnd);
+            }
+
+            chunkEnd = chunkEnd.AddDays(-1);
+        }
+
+        // Set initial cursor to now
+        _mirror.UpdateCursor(sourceTable, DateTime.UtcNow, totalRows);
+        _logger.LogInformation("{Table}: backfill complete. {TotalRows} rows ingested", sourceTable, totalRows);
+    }
+
+    private async Task IngestCycle(CancellationToken ct)
+    {
+        await IngestTable("Log_Transactions", ct);
+        await IngestTable("AlarmLog", ct);
+    }
+
+    private async Task IngestTable(string sourceTable, CancellationToken ct)
+    {
+        try
+        {
+            var cursor = _mirror.GetCursor(sourceTable);
+            if (!cursor.HasValue)
+            {
+                _logger.LogWarning("{Table}: no cursor, skipping incremental ingest", sourceTable);
+                return;
+            }
+
+            // SDK strict > off-by-one: subtract 1ms to include boundary events
+            var sinceDate = cursor.Value.AddMilliseconds(-1);
+
+            int count = 0;
+            DateTime maxDt = cursor.Value;
+
+            if (sourceTable == "Log_Transactions")
+            {
+                var records = await _sdk.GetLogTransactionsAsync(sinceDate, ct);
+                if (records.Count > 0)
+                {
+                    _mirror.IngestTransactions(records);
+                    count = records.Count;
+                    maxDt = records.Max(r => r.DtDate);
+                }
+            }
+            else if (sourceTable == "AlarmLog")
+            {
+                var records = await _sdk.GetAlarmLogAsync(sinceDate, ct);
+                if (records.Count > 0)
+                {
+                    _mirror.IngestAlarms(records);
+                    count = records.Count;
+                    maxDt = records.Where(r => r.DtDate.HasValue).Max(r => r.DtDate!.Value);
+                }
+            }
+
+            if (count > 0)
+            {
+                _mirror.UpdateCursor(sourceTable, maxDt, count);
+                _logger.LogInformation("{Table}: ingested {Count} rows, cursor → {Cursor}",
+                    sourceTable, count, maxDt);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "{Table}: ingest cycle failed", sourceTable);
+            _mirror.UpdateCursor(sourceTable,
+                _mirror.GetCursor(sourceTable) ?? DateTime.UtcNow,
+                0, ex.Message);
+        }
+    }
+}

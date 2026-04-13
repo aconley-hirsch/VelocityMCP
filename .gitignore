@@ -1,0 +1,14 @@
+bin/
+obj/
+*.duckdb
+*.duckdb.wal
+.vs/
+*.user
+*.suo
+.DS_Store
+.claude/
+
+# Local-only planning / session docs (kept out of version control)
+NEXTSTEPS.md
+PLAN.md
+START_HERE.md
