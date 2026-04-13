@@ -1147,6 +1147,64 @@ public class EndToEndTests : IDisposable
     }
 
     [Fact]
+    public void List_doors_returns_catalog_with_derived_status()
+    {
+        var schema = new DuckDbSchema(_connString, NullLogger<DuckDbSchema>.Instance);
+        schema.EnsureCreated();
+
+        using var mirror = new DuckDbMirror(_connString, NullLogger<DuckDbMirror>.Instance);
+        using var client = new FakeVelocityClient();
+
+        mirror.UpsertDoors(client.GetDoorsAsync().Result);
+        mirror.UpsertReaders(client.GetReadersAsync().Result);
+        mirror.IngestTransactions(client.GetLogTransactionsAsync(DateTime.UtcNow.AddHours(-1)).Result);
+
+        var rows = mirror.ListDoors(windowHours: 24, includeInactive: true, limit: 100);
+
+        // All 7 fake doors should be present (catalog listing)
+        Assert.Equal(7, rows.Count);
+
+        // Every door row has a name and a reader_count matching dim_readers
+        Assert.All(rows, r =>
+        {
+            Assert.NotNull(r.Name);
+            Assert.True(r.ReaderCount >= 1, $"{r.Name} expected at least 1 reader, got {r.ReaderCount}");
+            Assert.Equal(r.ReaderCount, r.ReaderNames.Count);
+        });
+
+        // Multi-reader doors: Front Door (1), Parking Garage (6), Lobby (7) each have 2 readers
+        var frontDoor = rows.Single(r => r.DoorId == 1);
+        Assert.Equal(2, frontDoor.ReaderCount);
+        Assert.Contains("Front Door Reader 1", frontDoor.ReaderNames);
+        Assert.Contains("Front Door Reader 2", frontDoor.ReaderNames);
+
+        // Status sanity: an hour of ingested traffic means at least one door should be 'active'
+        Assert.Contains(rows, r => r.Status == "active");
+        Assert.All(rows, r => Assert.Contains(r.Status, new[] { "active", "quiet", "stale", "never_seen" }));
+    }
+
+    [Fact]
+    public void List_doors_includeinactive_false_hides_never_seen_and_stale()
+    {
+        var schema = new DuckDbSchema(_connString, NullLogger<DuckDbSchema>.Instance);
+        schema.EnsureCreated();
+
+        using var mirror = new DuckDbMirror(_connString, NullLogger<DuckDbMirror>.Instance);
+        using var client = new FakeVelocityClient();
+
+        mirror.UpsertDoors(client.GetDoorsAsync().Result);
+        mirror.UpsertReaders(client.GetReadersAsync().Result);
+        // No transactions ingested → every door is 'never_seen'
+
+        var withInactive = mirror.ListDoors(windowHours: 24, includeInactive: true, limit: 100);
+        Assert.Equal(7, withInactive.Count);
+        Assert.All(withInactive, r => Assert.Equal("never_seen", r.Status));
+
+        var withoutInactive = mirror.ListDoors(windowHours: 24, includeInactive: false, limit: 100);
+        Assert.Empty(withoutInactive);
+    }
+
+    [Fact]
     public void Lookup_alarm_categories_returns_seed_data()
     {
         var schema = new DuckDbSchema(_connString, NullLogger<DuckDbSchema>.Instance);

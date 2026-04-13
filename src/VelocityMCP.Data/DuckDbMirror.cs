@@ -587,6 +587,121 @@ public sealed class DuckDbMirror : IDisposable
         _logger.LogInformation("Upserted {Count} readers", readers.Count);
     }
 
+    // ── Door catalog with derived status ────────────────────────────────
+
+    /// <summary>
+    /// Full door catalog with activity-derived status. Returns every door in
+    /// <c>dim_doors</c> with its reader list, admin active flag, last_seen_at
+    /// (most recent dt_date across all the door's readers), events_in_window
+    /// (count in the last <paramref name="windowHours"/>), and open_alarms
+    /// (unacked alarms with <c>net_address = controller_addr</c>, best-effort).
+    /// Status is derived from activity: "active" if events_in_window > 0,
+    /// "quiet" if no events in the window but last_seen_at within 7 days,
+    /// "stale" if last_seen_at older than 7 days, "never_seen" if no events ever.
+    /// NOTE: this is NOT real-time Velocity device state (online/offline,
+    /// locked/unlocked, position sensor) — that requires a live SDK call.
+    /// </summary>
+    public List<DoorStatusRow> ListDoors(int windowHours, bool includeInactive, int limit)
+    {
+        var now = DateTime.UtcNow;
+        var windowStart = now.AddHours(-windowHours);
+        var stalenessCutoff = now.AddDays(-7);
+
+        // One query: doors LEFT JOIN readers LEFT JOIN transactions, aggregated.
+        var rows = new List<(int DoorId, string? Name, string? ControllerAddr, bool Active,
+            string? ReaderNames, int ReaderCount,
+            DateTime? LastSeen, long EventsInWindow)>();
+
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT
+                  d.door_id,
+                  d.name,
+                  d.controller_addr,
+                  d.active,
+                  STRING_AGG(DISTINCT r.name, ', ' ORDER BY r.name) AS reader_names,
+                  COUNT(DISTINCT r.reader_id) AS reader_count,
+                  MAX(t.dt_date) AS last_seen_at,
+                  COUNT(*) FILTER (WHERE t.dt_date >= $window_start) AS events_in_window
+                FROM dim_doors d
+                LEFT JOIN dim_readers r ON r.door_id = d.door_id
+                LEFT JOIN fact_transactions t ON t.reader_name = r.name
+                GROUP BY d.door_id, d.name, d.controller_addr, d.active
+                ORDER BY d.name
+                LIMIT $limit
+                """;
+            cmd.Parameters.Add(new DuckDBParameter("window_start", windowStart));
+            cmd.Parameters.Add(new DuckDBParameter("limit", limit));
+
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                rows.Add((
+                    DoorId: reader.GetInt32(0),
+                    Name: reader.IsDBNull(1) ? null : reader.GetString(1),
+                    ControllerAddr: reader.IsDBNull(2) ? null : reader.GetString(2),
+                    Active: reader.GetBoolean(3),
+                    ReaderNames: reader.IsDBNull(4) ? null : reader.GetString(4),
+                    ReaderCount: reader.IsDBNull(5) ? 0 : (int)reader.GetInt64(5),
+                    LastSeen: reader.IsDBNull(6) ? null : reader.GetDateTime(6),
+                    EventsInWindow: reader.GetInt64(7)));
+            }
+        }
+
+        // Second query: unacked alarms per controller_addr. Skipped entirely when
+        // there are no rows (small systems with no alarms) to avoid an extra round trip.
+        var openAlarmsByAddr = new Dictionary<string, long>();
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT net_address, COUNT(*) AS cnt
+                FROM fact_alarms
+                WHERE ak_date IS NULL AND net_address IS NOT NULL
+                GROUP BY net_address
+                """;
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                openAlarmsByAddr[reader.GetString(0)] = reader.GetInt64(1);
+            }
+        }
+
+        var result = new List<DoorStatusRow>();
+        foreach (var r in rows)
+        {
+            var openAlarms = (r.ControllerAddr != null && openAlarmsByAddr.TryGetValue(r.ControllerAddr, out var n))
+                ? n : 0;
+
+            string status;
+            if (r.LastSeen == null) status = "never_seen";
+            else if (r.EventsInWindow > 0) status = "active";
+            else if (r.LastSeen >= stalenessCutoff) status = "quiet";
+            else status = "stale";
+
+            // Skip inactive doors if the caller didn't ask for them.
+            if (!includeInactive && (status == "never_seen" || status == "stale")) continue;
+
+            var readerList = string.IsNullOrEmpty(r.ReaderNames)
+                ? new List<string>()
+                : r.ReaderNames.Split(", ").ToList();
+
+            result.Add(new DoorStatusRow(
+                DoorId: r.DoorId,
+                Name: r.Name,
+                ControllerAddr: r.ControllerAddr,
+                AdminActive: r.Active,
+                ReaderCount: r.ReaderCount,
+                ReaderNames: readerList,
+                LastSeenAt: r.LastSeen,
+                EventsInWindow: r.EventsInWindow,
+                OpenAlarms: openAlarms,
+                Status: status));
+        }
+
+        return result;
+    }
+
     // ── Authorization dimension upserts ─────────────────────────────────
 
     public void UpsertClearances(IReadOnlyList<Models.ClearanceRecord> clearances)
@@ -2685,6 +2800,18 @@ public record DailySecurityBriefingMetrics(
     long ForcedOpens,
     long HeldOpens);
 public record NotableDenier(long PersonId, string? PersonName, long DenialCount);
+public record DoorStatusRow(
+    int DoorId,
+    string? Name,
+    string? ControllerAddr,
+    bool AdminActive,
+    int ReaderCount,
+    List<string> ReaderNames,
+    DateTime? LastSeenAt,
+    long EventsInWindow,
+    long OpenAlarms,
+    string Status);
+
 public record GrantingClearance(
     int ClearanceId,
     string Name,
