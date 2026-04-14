@@ -105,7 +105,8 @@ public sealed class FakeVelocityClient : IVelocityClient
                 ReaderName = ReaderNames[readerIdx],
                 FromZone = 0,
                 ToZone = 1,
-                Uid1 = hasPerson ? 1000 + personIdx : 0,
+                // Uid1 mirrors real Velocity semantics: CredentialId, not PersonId.
+                Uid1 = hasPerson ? 5000 + personIdx : 0,
                 Uid1Name = hasPerson ? $"{FirstNames[personIdx]} {LastNames[personIdx]}" : null,
                 Uid2 = 0,
                 Uid2Name = null,
@@ -156,7 +157,7 @@ public sealed class FakeVelocityClient : IVelocityClient
                 AkOperator = acked ? "admin" : null,
                 ClOperator = cleared ? "admin" : null,
                 WorkstationName = "VELOCITY-WS1",
-                Uid1 = hasPerson ? 1000 + personIdx : null,
+                Uid1 = hasPerson ? 5000 + personIdx : null,
                 Uid1Name = hasPerson ? $"{FirstNames[personIdx]} {LastNames[personIdx]}" : null,
                 Uid2 = null,
                 Uid2Name = null,
@@ -214,6 +215,22 @@ public sealed class FakeVelocityClient : IVelocityClient
         }).ToList();
 
         return Task.FromResult(people);
+    }
+
+    // Fake 1:1 credential-to-person mapping — one badge per person, CredentialId
+    // deliberately offset from PersonId so tests catch code that assumes they're
+    // the same number space.
+    public Task<List<UserCredentialRecord>> GetUserCredentialsAsync(CancellationToken ct = default)
+    {
+        var creds = FirstNames
+            .Zip(LastNames)
+            .Select((_, i) => new UserCredentialRecord
+            {
+                CredentialId = 5000 + i,
+                PersonId = 1000 + i,
+            })
+            .ToList();
+        return Task.FromResult(creds);
     }
 
     // ── Authorization / clearance seed data ─────────────────────────────

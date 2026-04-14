@@ -18,6 +18,7 @@ public interface IVelocityClient : IDisposable
     Task<List<DoorRecord>> GetDoorsAsync(CancellationToken ct = default);
     Task<List<ReaderRecord>> GetReadersAsync(CancellationToken ct = default);
     Task<List<PersonRecord>> GetPersonsAsync(CancellationToken ct = default);
+    Task<List<UserCredentialRecord>> GetUserCredentialsAsync(CancellationToken ct = default);
 
     // ── Authorization / policy dimensions ──────────────────────────────
     // These feed dim_clearances / dim_reader_clearances / dim_person_clearances.

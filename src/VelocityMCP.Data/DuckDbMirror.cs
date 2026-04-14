@@ -229,9 +229,32 @@ public sealed class DuckDbMirror : IDisposable
         return (long)cmd.ExecuteScalar()!;
     }
 
+    public DimensionCounts GetDimensionCounts()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT
+                (SELECT COUNT(*) FROM dim_people),
+                (SELECT COUNT(*) FROM dim_doors),
+                (SELECT COUNT(*) FROM dim_readers),
+                (SELECT COUNT(*) FROM dim_clearances),
+                (SELECT COUNT(*) FROM fact_transactions),
+                (SELECT COUNT(*) FROM fact_alarms)
+            """;
+        using var rd = cmd.ExecuteReader();
+        rd.Read();
+        return new DimensionCounts(
+            People:       rd.GetInt64(0),
+            Doors:        rd.GetInt64(1),
+            Readers:      rd.GetInt64(2),
+            Clearances:   rd.GetInt64(3),
+            Transactions: rd.GetInt64(4),
+            Alarms:       rd.GetInt64(5));
+    }
+
     public long CountTransactions(DateTime since, DateTime until, int? eventCode = null,
         string? readerName = null, IReadOnlyList<string>? readerNames = null,
-        long? uid1 = null, int? disposition = null, int? doorId = null)
+        long? personId = null, int? disposition = null, int? doorId = null)
     {
         var (doorProvided, mergedReaders) = ResolveDoorReaders(doorId, readerName, readerNames);
         if (doorProvided && mergedReaders!.Count == 0) return 0;
@@ -240,7 +263,7 @@ public sealed class DuckDbMirror : IDisposable
             since, until, eventCode,
             doorProvided ? null : readerName,
             doorProvided ? mergedReaders : readerNames,
-            uid1, disposition);
+            personId, disposition);
 
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = $"SELECT COUNT(*) FROM fact_transactions {where}";
@@ -260,7 +283,7 @@ public sealed class DuckDbMirror : IDisposable
         string groupBy,
         DateTime since, DateTime until,
         int? eventCode, string? readerName, IReadOnlyList<string>? readerNames,
-        long? uid1, int? disposition,
+        long? personId, int? disposition,
         int limit, int? doorId = null)
     {
         var (doorProvided, mergedReaders) = ResolveDoorReaders(doorId, readerName, readerNames);
@@ -279,21 +302,39 @@ public sealed class DuckDbMirror : IDisposable
         {
             return AggregateTransactionsByDoor(
                 since, until, eventCode, effectiveReaderName, effectiveReaderNames,
-                uid1, disposition, limit);
+                personId, disposition, limit);
         }
+
+        // group_by="person" rolls credentials up to the real person via
+        // dim_user_credentials → dim_people. key_id is a HostUserId, key is
+        // the person's full_name. This is the ONLY group_by where the same
+        // person's multiple badges get combined into one bucket.
+        if (groupByLower == "person")
+        {
+            return AggregateTransactionsByPerson(
+                since, until, eventCode, effectiveReaderName, effectiveReaderNames,
+                personId, disposition, limit);
+        }
+
+        // group_by="credential" keeps the raw credential-level view: one bucket
+        // per distinct uid1. key is the denormalized uid1_name, key_id is the
+        // CredentialId. Useful for spotting a single rogue badge or for cases
+        // where the owner changed between swipes.
+        const string credentialKeyExpr =
+            "COALESCE(uid1_name, 'Unknown credential ' || CAST(uid1 AS VARCHAR))";
 
         var (keyExpr, keyIdExpr, groupKey) = groupByLower switch
         {
-            "person" => ("uid1_name", "uid1", "uid1_name, uid1"),
+            "credential" => (credentialKeyExpr, "uid1", "uid1_name, uid1"),
             "reader" => ("reader_name", "NULL", "reader_name"),
             "type" or "event" or "event_code" => ("description", "event_code", "event_code, description"),
             "hour" => ("CAST(DATE_TRUNC('hour', dt_date) AS VARCHAR)", "NULL", "DATE_TRUNC('hour', dt_date)"),
             "day" => ("CAST(DATE_TRUNC('day', dt_date) AS VARCHAR)", "NULL", "DATE_TRUNC('day', dt_date)"),
-            _ => throw new ArgumentException($"Unsupported group_by: {groupBy}. Use person, door, reader, type, hour, or day.")
+            _ => throw new ArgumentException($"Unsupported group_by: {groupBy}. Use person, credential, door, reader, type, hour, or day.")
         };
 
         var (where, parameters) = BuildTransactionFilter(
-            since, until, eventCode, effectiveReaderName, effectiveReaderNames, uid1, disposition);
+            since, until, eventCode, effectiveReaderName, effectiveReaderNames, personId, disposition);
 
         // Total events matching the filter
         long totalEvents;
@@ -312,7 +353,7 @@ public sealed class DuckDbMirror : IDisposable
             {
                 "hour" => $"SELECT COUNT(DISTINCT DATE_TRUNC('hour', dt_date)) FROM fact_transactions {where}",
                 "day" => $"SELECT COUNT(DISTINCT DATE_TRUNC('day', dt_date)) FROM fact_transactions {where}",
-                "person" => $"SELECT COUNT(DISTINCT uid1) FROM fact_transactions {where}",
+                "credential" => $"SELECT COUNT(DISTINCT uid1) FROM fact_transactions {where}",
                 "reader" => $"SELECT COUNT(DISTINCT reader_name) FROM fact_transactions {where}",
                 _ => $"SELECT COUNT(DISTINCT event_code) FROM fact_transactions {where}"
             };
@@ -354,6 +395,112 @@ public sealed class DuckDbMirror : IDisposable
     }
 
     /// <summary>
+    /// Aggregate transactions by real person. Resolves each uid1 through
+    /// dim_user_credentials → dim_people so a person with multiple badges gets
+    /// their events summed into one bucket. Transactions whose credential
+    /// isn't in dim_user_credentials (orphans) roll up under a single
+    /// "Unknown" bucket keyed on the denormalized uid1_name when available,
+    /// so the model still sees them rather than silently dropping the rows.
+    /// </summary>
+    private AggregationResult AggregateTransactionsByPerson(
+        DateTime since, DateTime until,
+        int? eventCode, string? readerName, IReadOnlyList<string>? readerNames,
+        long? personId, int? disposition, int limit)
+    {
+        var (where, parameters) = BuildTransactionFilter(
+            since, until, eventCode, readerName, readerNames, personId, disposition);
+
+        // Left-join through credentials → people so the bucket key is the real
+        // HostUserId, not the credential id. Qualified column names throughout
+        // because dim_user_credentials.person_id and dim_people.person_id both
+        // exist and would otherwise be ambiguous.
+        var fromJoin = """
+            fact_transactions t
+            LEFT JOIN dim_user_credentials c ON c.credential_id = t.uid1
+            LEFT JOIN dim_people p ON p.person_id = c.person_id
+            """;
+
+        // Patch the WHERE clause: BuildTransactionFilter was written for an
+        // un-aliased fact_transactions, so every column ref is bare. Re-prefix
+        // them with t. so they resolve under the join.
+        var whereQualified = where
+            .Replace(" dt_date ", " t.dt_date ")
+            .Replace(" event_code ", " t.event_code ")
+            .Replace(" reader_name ", " t.reader_name ")
+            .Replace(" disposition ", " t.disposition ")
+            .Replace(" uid1 ", " t.uid1 ");
+
+        long totalEvents;
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = $"SELECT COUNT(*) FROM {fromJoin} {whereQualified}";
+            foreach (var p in parameters) cmd.Parameters.Add(p);
+            totalEvents = (long)cmd.ExecuteScalar()!;
+        }
+
+        // Composite group key: resolved rows collapse to "person:<id>",
+        // orphans stay split by credential as "cred:<id>". So one bucket per
+        // real person (regardless of how many badges they own) and one bucket
+        // per orphan credential that couldn't be resolved.
+        const string compositeGroupKey =
+            "COALESCE('person:' || CAST(p.person_id AS VARCHAR), 'cred:' || CAST(t.uid1 AS VARCHAR))";
+
+        long totalGroups;
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = $"""
+                SELECT COUNT(DISTINCT {compositeGroupKey})
+                FROM {fromJoin} {whereQualified}
+                """;
+            foreach (var p in parameters) cmd.Parameters.Add(p);
+            totalGroups = (long)cmd.ExecuteScalar()!;
+        }
+
+        // key: person's full_name when matched, denormalized uid1_name for
+        // orphans, synthesized "Unknown credential <id>" as last resort.
+        // key_id: real HostUserId when matched, null for orphans.
+        // MAX() is safe here because within a matched group all p.full_name
+        // values are identical (same person), and within an orphan group all
+        // t.uid1_name values are identical (same credential).
+        var groups = new List<AggregationBucket>();
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = $"""
+                SELECT
+                    COALESCE(
+                        MAX(p.full_name),
+                        MAX(t.uid1_name),
+                        'Unknown credential ' || CAST(MAX(t.uid1) AS VARCHAR)
+                    ) AS key,
+                    MAX(p.person_id) AS key_id,
+                    COUNT(*) AS count
+                FROM {fromJoin} {whereQualified}
+                GROUP BY {compositeGroupKey}
+                ORDER BY count DESC
+                LIMIT $limit
+                """;
+            foreach (var p in parameters) cmd.Parameters.Add(p);
+            cmd.Parameters.Add(new DuckDBParameter("limit", limit));
+
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                groups.Add(new AggregationBucket(
+                    rd.IsDBNull(0) ? null : rd.GetValue(0).ToString(),
+                    rd.IsDBNull(1) ? null : Convert.ToInt64(rd.GetValue(1)),
+                    rd.GetInt64(2)));
+            }
+        }
+
+        return new AggregationResult(
+            "person",
+            groups,
+            totalEvents,
+            totalGroups,
+            Truncated: totalGroups > limit);
+    }
+
+    /// <summary>
     /// Aggregate transactions by logical door (one row per door, not per reader).
     /// Joins fact_transactions through dim_readers → dim_doors. Orphan readers
     /// (not in dim_readers, or with NULL door_id) are surfaced under their raw
@@ -362,11 +509,11 @@ public sealed class DuckDbMirror : IDisposable
     private AggregationResult AggregateTransactionsByDoor(
         DateTime since, DateTime until,
         int? eventCode, string? readerName, IReadOnlyList<string>? readerNames,
-        long? uid1, int? disposition,
+        long? personId, int? disposition,
         int limit)
     {
         var (where, parameters) = BuildTransactionFilter(
-            since, until, eventCode, readerName, readerNames, uid1, disposition);
+            since, until, eventCode, readerName, readerNames, personId, disposition);
 
         long totalEvents;
         using (var cmd = _conn.CreateCommand())
@@ -427,7 +574,7 @@ public sealed class DuckDbMirror : IDisposable
     public SampleResult SampleTransactions(
         DateTime since, DateTime until,
         int? eventCode, string? readerName, IReadOnlyList<string>? readerNames,
-        long? uid1, int? disposition,
+        long? personId, int? disposition,
         string order, int limit, int? doorId = null)
     {
         var (doorProvided, mergedReaders) = ResolveDoorReaders(doorId, readerName, readerNames);
@@ -438,7 +585,7 @@ public sealed class DuckDbMirror : IDisposable
             since, until, eventCode,
             doorProvided ? null : readerName,
             doorProvided ? mergedReaders : readerNames,
-            uid1, disposition);
+            personId, disposition);
         var orderSql = order.Equals("time_asc", StringComparison.OrdinalIgnoreCase) ? "dt_date ASC" : "dt_date DESC";
 
         long totalMatching;
@@ -480,10 +627,19 @@ public sealed class DuckDbMirror : IDisposable
         return new SampleResult(rows, totalMatching, Truncated: totalMatching > limit);
     }
 
+    /// <summary>
+    /// person_id filters on fact_transactions MUST expand through dim_user_credentials.
+    /// fact_transactions.uid1 is a CredentialId, not a HostUserId — direct
+    /// equality would only match by coincidence. Inlined as a SQL fragment so
+    /// every filter-building site uses the same join path.
+    /// </summary>
+    internal const string PersonToUid1FilterFragment =
+        "uid1 IN (SELECT credential_id FROM dim_user_credentials WHERE person_id = $pid)";
+
     internal static (string Where, List<DuckDBParameter> Parameters) BuildTransactionFilter(
         DateTime since, DateTime until,
         int? eventCode, string? readerName, IReadOnlyList<string>? readerNames,
-        long? uid1, int? disposition)
+        long? personId, int? disposition)
     {
         var where = "WHERE dt_date >= $since AND dt_date < $until";
         var parameters = new List<DuckDBParameter>
@@ -515,10 +671,10 @@ public sealed class DuckDbMirror : IDisposable
                 parameters.Add(new DuckDBParameter($"reader_name_{i}", allReaders[i]));
         }
 
-        if (uid1.HasValue)
+        if (personId.HasValue)
         {
-            where += " AND uid1 = $uid1";
-            parameters.Add(new DuckDBParameter("uid1", uid1.Value));
+            where += $" AND {PersonToUid1FilterFragment}";
+            parameters.Add(new DuckDBParameter("pid", personId.Value));
         }
         if (disposition.HasValue)
         {
@@ -941,6 +1097,36 @@ public sealed class DuckDbMirror : IDisposable
         _logger.LogInformation("Upserted {Count} people", people.Count);
     }
 
+    public void UpsertUserCredentials(IReadOnlyList<Models.UserCredentialRecord> credentials)
+    {
+        if (credentials.Count == 0) return;
+        using var tx = _conn.BeginTransaction();
+        // Authoritative replace: delete and reinsert. Credentials get revoked
+        // (rows removed upstream) so we can't just UPSERT — we'd leave stale
+        // mappings pointing at people who no longer own the credential.
+        using (var clr = _conn.CreateCommand())
+        {
+            clr.Transaction = tx;
+            clr.CommandText = "DELETE FROM dim_user_credentials";
+            clr.ExecuteNonQuery();
+        }
+        foreach (var c in credentials)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                INSERT INTO dim_user_credentials (credential_id, person_id, updated_at)
+                VALUES ($cid, $pid, $now)
+                """;
+            cmd.Parameters.Add(new DuckDBParameter("cid", c.CredentialId));
+            cmd.Parameters.Add(new DuckDBParameter("pid", c.PersonId));
+            cmd.Parameters.Add(new DuckDBParameter("now", DateTime.UtcNow));
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+        _logger.LogInformation("Upserted {Count} user credentials", credentials.Count);
+    }
+
     // ── Dimension fuzzy search ──────────────────────────────────────────
 
     public List<DoorMatch> SearchDoors(string query, int limit)
@@ -1104,9 +1290,14 @@ public sealed class DuckDbMirror : IDisposable
         var sampleSql = entityLower switch
         {
             "person" => """
+                -- Expand person → their credentials → transactions. A person is
+                -- inactive iff NONE of their credentials had a transaction in the
+                -- window. LEFT JOIN through dim_user_credentials because
+                -- fact_transactions.uid1 is a CredentialId, not a HostUserId.
                 SELECT p.person_id, p.full_name, MAX(t.dt_date) AS last_seen_at
                 FROM dim_people p
-                LEFT JOIN fact_transactions t ON t.uid1 = p.person_id
+                LEFT JOIN dim_user_credentials c ON c.person_id = p.person_id
+                LEFT JOIN fact_transactions t ON t.uid1 = c.credential_id
                 GROUP BY p.person_id, p.full_name
                 HAVING COUNT(t.log_id) FILTER (WHERE t.dt_date >= $since AND t.dt_date < $until) = 0
                 ORDER BY last_seen_at NULLS LAST
@@ -1144,7 +1335,8 @@ public sealed class DuckDbMirror : IDisposable
                 SELECT COUNT(*) FROM (
                   SELECT p.person_id
                   FROM dim_people p
-                  LEFT JOIN fact_transactions t ON t.uid1 = p.person_id
+                  LEFT JOIN dim_user_credentials c ON c.person_id = p.person_id
+                  LEFT JOIN fact_transactions t ON t.uid1 = c.credential_id
                   GROUP BY p.person_id
                   HAVING COUNT(t.log_id) FILTER (WHERE t.dt_date >= $since AND t.dt_date < $until) = 0
                 )
@@ -1227,7 +1419,7 @@ public sealed class DuckDbMirror : IDisposable
         string bucket,
         DateTime since, DateTime until,
         int? eventCode, string? readerName, IReadOnlyList<string>? readerNames,
-        long? uid1, int? disposition, int? doorId = null)
+        long? personId, int? disposition, int? doorId = null)
     {
         var truncUnit = bucket.ToLowerInvariant() switch
         {
@@ -1246,7 +1438,7 @@ public sealed class DuckDbMirror : IDisposable
             since, until, eventCode,
             doorProvided ? null : readerName,
             doorProvided ? mergedReaders : readerNames,
-            uid1, disposition);
+            personId, disposition);
 
         // DuckDB's generate_series + date_trunc lets us zero-fill empty buckets
         // in a single query rather than post-processing in C#.
@@ -1827,7 +2019,7 @@ public sealed class DuckDbMirror : IDisposable
         DateTime since, DateTime until, long? personId, int limit)
     {
         var where = "WHERE dt_date >= $since AND dt_date < $until AND disposition = 1 AND uid1 > 0";
-        if (personId.HasValue) where += " AND uid1 = $pid";
+        if (personId.HasValue) where += $" AND {PersonToUid1FilterFragment}";
 
         long totalRows;
         using (var cmd = _conn.CreateCommand())
@@ -2281,7 +2473,7 @@ public sealed class DuckDbMirror : IDisposable
         DateTime? firstSeen, lastSeen;
         using (var cmd = _conn.CreateCommand())
         {
-            cmd.CommandText = """
+            cmd.CommandText = $"""
                 SELECT
                   COUNT(*),
                   COUNT(*) FILTER (WHERE disposition > 1),
@@ -2290,7 +2482,7 @@ public sealed class DuckDbMirror : IDisposable
                   MAX(t.dt_date)
                 FROM fact_transactions t
                 LEFT JOIN dim_readers r ON r.name = t.reader_name
-                WHERE t.uid1 = $pid AND t.dt_date >= $since AND t.dt_date < $until
+                WHERE t.{PersonToUid1FilterFragment} AND t.dt_date >= $since AND t.dt_date < $until
                 """;
             cmd.Parameters.Add(new DuckDBParameter("pid", personId));
             cmd.Parameters.Add(new DuckDBParameter("since", since));
@@ -2322,12 +2514,12 @@ public sealed class DuckDbMirror : IDisposable
         var topDoors = new List<DoorCountRow>();
         using (var cmd = _conn.CreateCommand())
         {
-            cmd.CommandText = """
+            cmd.CommandText = $"""
                 SELECT d.door_id, d.name, COUNT(*) AS cnt
                 FROM fact_transactions t
                 JOIN dim_readers r ON r.name = t.reader_name
                 JOIN dim_doors d ON d.door_id = r.door_id
-                WHERE t.uid1 = $pid AND t.dt_date >= $since AND t.dt_date < $until
+                WHERE t.{PersonToUid1FilterFragment} AND t.dt_date >= $since AND t.dt_date < $until
                 GROUP BY d.door_id, d.name
                 ORDER BY cnt DESC
                 LIMIT $limit
@@ -2350,10 +2542,10 @@ public sealed class DuckDbMirror : IDisposable
         var hourCounts = new long[24];
         using (var cmd = _conn.CreateCommand())
         {
-            cmd.CommandText = """
+            cmd.CommandText = $"""
                 SELECT CAST(EXTRACT(HOUR FROM dt_date) AS INTEGER) AS h, COUNT(*)
                 FROM fact_transactions
-                WHERE uid1 = $pid AND dt_date >= $since AND dt_date < $until
+                WHERE {PersonToUid1FilterFragment} AND dt_date >= $since AND dt_date < $until
                 GROUP BY h
                 """;
             cmd.Parameters.Add(new DuckDBParameter("pid", personId));
@@ -2373,11 +2565,11 @@ public sealed class DuckDbMirror : IDisposable
         var recentDenials = new List<SampleRow>();
         using (var cmd = _conn.CreateCommand())
         {
-            cmd.CommandText = """
+            cmd.CommandText = $"""
                 SELECT log_id, dt_date, event_code, description, disposition,
                        reader_name, uid1, uid1_name
                 FROM fact_transactions
-                WHERE uid1 = $pid AND dt_date >= $since AND dt_date < $until AND disposition > 1
+                WHERE {PersonToUid1FilterFragment} AND dt_date >= $since AND dt_date < $until AND disposition > 1
                 ORDER BY dt_date DESC
                 LIMIT $limit
                 """;
@@ -2638,6 +2830,14 @@ public record DispositionRow(int Disposition, string Name);
 public record DoorMatch(int DoorId, string Name, string? ControllerAddr, List<string> Readers);
 public record ReaderMatch(int ReaderId, string Name);
 public record PersonMatch(int PersonId, string? FirstName, string? LastName, string FullName);
+
+public record DimensionCounts(
+    long People,
+    long Doors,
+    long Readers,
+    long Clearances,
+    long Transactions,
+    long Alarms);
 
 public record AggregationBucket(string? Key, long? KeyId, long Count);
 public record AggregationResult(

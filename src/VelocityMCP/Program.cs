@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using VelocityMCP.Data;
 using VelocityMCP.Tools;
 
@@ -37,14 +38,32 @@ void RegisterServices(IServiceCollection services, IConfiguration config)
         return new DuckDbMirror(connectionString, sp.GetRequiredService<ILogger<DuckDbMirror>>());
     });
 
+    services.Configure<VelocityOptions>(opts =>
+    {
+        var section = config.GetSection("Velocity");
+        opts.SqlServer = section["SqlServer"]
+            ?? Environment.GetEnvironmentVariable("VELOCITY_SQL_SERVER")
+            ?? opts.SqlServer;
+        opts.Database = section["Database"]
+            ?? Environment.GetEnvironmentVariable("VELOCITY_DATABASE")
+            ?? opts.Database;
+        opts.AppRolePassword = section["AppRolePassword"]
+            ?? Environment.GetEnvironmentVariable("VELOCITY_APP_ROLE_PW");
+        opts.UseFake = useFakeClient;
+    });
+
     if (useFakeClient)
     {
         services.AddSingleton<IVelocityClient, FakeVelocityClient>();
     }
     else
     {
+#if VELOCITY_REAL
+        services.AddSingleton<IVelocityClient, RealVelocityConnector>();
+#else
         throw new PlatformNotSupportedException(
-            "Real VelocityAdapter SDK requires Windows x64. Set Velocity:UseFake=true for development.");
+            "Real VelocityAdapter SDK requires Windows. Build on Windows or set Velocity:UseFake=true.");
+#endif
     }
 
     // Fake SDK mints unique LogIds per call, so we can amass ~3k transactions
@@ -60,7 +79,8 @@ void RegisterServices(IServiceCollection services, IConfiguration config)
         sp.GetRequiredService<ILogger<IngestWorker>>(),
         interval: TimeSpan.FromSeconds(int.TryParse(config["Ingest:IntervalSeconds"], out var i) ? i : 30),
         backfillHorizon: TimeSpan.FromDays(int.TryParse(config["Ingest:BackfillDays"], out var d) ? d : 7),
-        bulkBackfillCalls: bulkBackfillCalls
+        bulkBackfillCalls: bulkBackfillCalls,
+        policyInterval: TimeSpan.FromSeconds(int.TryParse(config["Ingest:PolicyRefreshSeconds"], out var p) ? p : 300)
     ));
 }
 

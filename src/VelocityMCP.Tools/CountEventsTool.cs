@@ -13,12 +13,17 @@ public sealed class CountEventsTool
                  "'how many times was the front door forced open this week?'. " +
                  "For breakdowns by dimension (person, door, type), use aggregate_events instead. " +
                  "PREFERRED door filter: pass `door_id` from find_doors and the tool will resolve the reader list for you. " +
-                 "Only fall back to `reader_name` / `reader_names` if you need to filter on individual readers.")]
+                 "Only fall back to `reader_name` / `reader_names` if you need to filter on individual readers. " +
+                 "TIME WINDOWS: for phrases like 'last week', 'yesterday', 'this month' pass `relative_window` " +
+                 "('last_7d', 'yesterday', 'this_month' — see that parameter for the full list). " +
+                 "Do NOT ask the user for ISO dates when a named window fits.")]
     public static string CountEvents(
         DuckDbMirror mirror,
-        [Description("Start of time window (ISO 8601). Defaults to 24 hours ago if omitted.")]
+        [Description(TimeWindow.ParameterDescription)]
+        string? relative_window = null,
+        [Description("Start of time window (ISO 8601). Prefer `relative_window` for phrases like 'last week'. Defaults to 24 hours ago when neither this nor relative_window is set.")]
         string? since = null,
-        [Description("End of time window (ISO 8601). Defaults to now if omitted.")]
+        [Description("End of time window (ISO 8601). Prefer `relative_window` for phrases like 'last week'. Defaults to now.")]
         string? until = null,
         [Description("Filter by event code (e.g. 4 = Door Forced Open). Use list_event_types to discover codes.")]
         int? event_code = null,
@@ -33,8 +38,8 @@ public sealed class CountEventsTool
         [Description("Filter by disposition (1 = Granted, 2 = Denied, etc.). Use list_dispositions to see values.")]
         int? disposition = null)
     {
-        var sinceDate = since != null ? DateTime.Parse(since).ToUniversalTime() : DateTime.UtcNow.AddHours(-24);
-        var untilDate = until != null ? DateTime.Parse(until).ToUniversalTime() : DateTime.UtcNow;
+        var (sinceDate, untilDate) = TimeWindow.Resolve(
+            relative_window, since, until, defaultWindow: TimeSpan.FromHours(24));
 
         var count = mirror.CountTransactions(
             sinceDate, untilDate, event_code, reader_name, reader_names,
@@ -47,8 +52,9 @@ public sealed class CountEventsTool
             {
                 since = sinceDate.ToString("o"),
                 until = untilDate.ToString("o"),
-                defaulted_since = since == null,
-                defaulted_until = until == null
+                relative_window,
+                defaulted_since = since == null && relative_window == null,
+                defaulted_until = until == null && relative_window == null
             }
         };
 

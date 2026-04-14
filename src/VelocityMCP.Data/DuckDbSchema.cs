@@ -323,6 +323,16 @@ public sealed class DuckDbSchema
                 updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- Credential → person mapping. Velocity's fact_transactions.uid1 is
+            -- a CredentialId, not a HostUserId. Tools that want "events for
+            -- person X" have to expand person → list of credentials first.
+            CREATE TABLE IF NOT EXISTS dim_user_credentials (
+                credential_id   INTEGER PRIMARY KEY,
+                person_id       INTEGER NOT NULL,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_creds_person ON dim_user_credentials(person_id);
+
             -- Authorization / policy dimension.
             -- dim_clearances: named groupings (Velocity calls them "access levels")
             --   schedule_name is informational in v1 (e.g. "24x7", "Business Hours 8-18 M-F");

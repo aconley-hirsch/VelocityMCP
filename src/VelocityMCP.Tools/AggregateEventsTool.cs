@@ -14,18 +14,25 @@ public sealed class AggregateEventsTool
                  "or 'how many distinct people used the side office' (use total_groups for that). " +
                  "Response includes total_events (grand total), total_groups (distinct values), " +
                  "truncated flag, and the resolved time window. " +
-                 "Supported group_by values: person, door, reader, type, hour, day. " +
-                 "IMPORTANT: 'door' collapses multi-reader doors into one row per logical door (preferred for 'busiest doors' questions). " +
+                 "Supported group_by values: person, credential, door, reader, type, hour, day. " +
+                 "IMPORTANT: 'person' rolls up all badges a person owns into ONE bucket — key_id is a real person_id (usable with person_dossier, find_people follow-ups). " +
+                 "'credential' groups by individual badge/card (key_id is a credential_id) — use only when credential-level granularity matters (e.g. 'is a specific badge being over-used'). " +
+                 "'door' collapses multi-reader doors into one row per logical door (preferred for 'busiest doors' questions). " +
                  "'reader' groups by individual physical reader (use only when reader-level granularity matters). " +
                  "Filters work the same as count_events — prefer `door_id` over `reader_names` for door-scoped filtering. " +
+                 "TIME WINDOWS: for phrases like 'last week', 'yesterday', 'this month' pass `relative_window` " +
+                 "('last_7d', 'yesterday', 'this_month' — see that parameter for the full list). " +
+                 "Do NOT ask the user for ISO dates when a named window fits. " +
                  "For a single count with no breakdown, use count_events instead.")]
     public static string AggregateEvents(
         DuckDbMirror mirror,
-        [Description("Dimension to group by: 'person', 'door' (logical, collapses multi-reader doors), 'reader' (physical), 'type', 'hour', or 'day'.")]
+        [Description("Dimension to group by: 'person' (real person, rolled up across their badges), 'credential' (individual badge/card), 'door' (logical, collapses multi-reader doors), 'reader' (physical), 'type', 'hour', or 'day'.")]
         string group_by,
-        [Description("Start of time window (ISO 8601). Defaults to 24 hours ago.")]
+        [Description(TimeWindow.ParameterDescription)]
+        string? relative_window = null,
+        [Description("Start of time window (ISO 8601). Prefer `relative_window` for phrases like 'last week'. Defaults to 24 hours ago when neither this nor relative_window is set.")]
         string? since = null,
-        [Description("End of time window (ISO 8601). Defaults to now.")]
+        [Description("End of time window (ISO 8601). Prefer `relative_window` for phrases like 'last week'. Defaults to now.")]
         string? until = null,
         [Description("Filter by event code. Use list_event_types to discover codes.")]
         int? event_code = null,
@@ -42,8 +49,8 @@ public sealed class AggregateEventsTool
         [Description("Maximum number of groups to return. Defaults to 10, max 50.")]
         int? limit = null)
     {
-        var sinceDate = since != null ? DateTime.Parse(since).ToUniversalTime() : DateTime.UtcNow.AddHours(-24);
-        var untilDate = until != null ? DateTime.Parse(until).ToUniversalTime() : DateTime.UtcNow;
+        var (sinceDate, untilDate) = TimeWindow.Resolve(
+            relative_window, since, until, defaultWindow: TimeSpan.FromHours(24));
         var effectiveLimit = Math.Min(limit ?? 10, 50);
 
         var result = mirror.AggregateTransactions(
@@ -69,8 +76,9 @@ public sealed class AggregateEventsTool
             {
                 since = sinceDate.ToString("o"),
                 until = untilDate.ToString("o"),
-                defaulted_since = since == null,
-                defaulted_until = until == null
+                relative_window,
+                defaulted_since = since == null && relative_window == null,
+                defaulted_until = until == null && relative_window == null
             }
         }, fullCount);
     }

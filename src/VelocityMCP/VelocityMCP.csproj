@@ -13,9 +13,19 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Host machine only has .NET 10 installed; roll forward from net8.0. -->
+    <RollForward>LatestMajor</RollForward>
+    <!-- VelocityAdapter.dll is net48 and transitively needs Microsoft.WindowsDesktop.App
+         for legacy System.Security.* types. The Data library opts into WinForms; the
+         exe itself has to too so the WindowsDesktop framework is loaded at runtime. -->
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(OS)' == 'Windows_NT'">
+    <DefineConstants>$(DefineConstants);VELOCITY_REAL</DefineConstants>
   </PropertyGroup>
 
 </Project>

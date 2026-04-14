@@ -14,6 +14,7 @@ public sealed class IngestWorker : BackgroundService
     private readonly DuckDbMirror _mirror;
     private readonly ILogger<IngestWorker> _logger;
     private readonly TimeSpan _interval;
+    private readonly TimeSpan _policyInterval;
     private readonly TimeSpan _backfillHorizon;
     private readonly int _bulkBackfillCalls;
 
@@ -23,20 +24,23 @@ public sealed class IngestWorker : BackgroundService
         ILogger<IngestWorker> logger,
         TimeSpan? interval = null,
         TimeSpan? backfillHorizon = null,
-        int bulkBackfillCalls = 1)
+        int bulkBackfillCalls = 1,
+        TimeSpan? policyInterval = null)
     {
         _sdk = sdk;
         _mirror = mirror;
         _logger = logger;
         _interval = interval ?? TimeSpan.FromSeconds(30);
+        _policyInterval = policyInterval ?? TimeSpan.FromMinutes(5);
         _backfillHorizon = backfillHorizon ?? TimeSpan.FromDays(7);
         _bulkBackfillCalls = Math.Max(1, bulkBackfillCalls);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("Ingest worker starting. Interval: {Interval}s, Backfill horizon: {Horizon} days",
-            _interval.TotalSeconds, _backfillHorizon.TotalDays);
+        _logger.LogInformation(
+            "Ingest worker starting. Fact interval: {Interval}s, Policy interval: {PolicyInterval}s, Backfill horizon: {Horizon} days",
+            _interval.TotalSeconds, _policyInterval.TotalSeconds, _backfillHorizon.TotalDays);
 
         if (!_sdk.IsConnected)
         {
@@ -44,18 +48,36 @@ public sealed class IngestWorker : BackgroundService
             _logger.LogInformation("SDK connected");
         }
 
-        // Refresh dimension tables at startup (and periodically in future phases)
+        // Refresh dimension + policy tables at startup
         await RefreshDimensions(stoppingToken);
 
         // Backfill if no cursor exists
         await BackfillIfNeeded("Log_Transactions", stoppingToken);
         await BackfillIfNeeded("AlarmLog", stoppingToken);
 
-        // Incremental ingest loop
+        // Two parallel loops: facts (fast) + policy/dimensions (slow). Policy data
+        // changes per-day, not per-second, so a 5-minute beat avoids hammering the
+        // SQL Server with the bulk clearance queries on every fact tick.
+        var factLoop = RunFactLoop(stoppingToken);
+        var policyLoop = RunPolicyLoop(stoppingToken);
+        await Task.WhenAll(factLoop, policyLoop);
+    }
+
+    private async Task RunFactLoop(CancellationToken stoppingToken)
+    {
         using var timer = new PeriodicTimer(_interval);
         while (await timer.WaitForNextTickAsync(stoppingToken))
         {
             await IngestCycle(stoppingToken);
+        }
+    }
+
+    private async Task RunPolicyLoop(CancellationToken stoppingToken)
+    {
+        using var timer = new PeriodicTimer(_policyInterval);
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            await RefreshDimensions(stoppingToken);
         }
     }
 
@@ -71,6 +93,12 @@ public sealed class IngestWorker : BackgroundService
 
             var people = await _sdk.GetPersonsAsync(ct);
             _mirror.UpsertPeople(people);
+
+            // Credential→person mapping — required so transaction tools can
+            // resolve fact_transactions.uid1 (a CredentialId) back to a real
+            // HostUserId. Refreshed on the policy cadence like the dim tables.
+            var credentials = await _sdk.GetUserCredentialsAsync(ct);
+            _mirror.UpsertUserCredentials(credentials);
 
             // Authorization / policy dimensions. These are small (hundreds of rows
             // at most) and change slowly — same refresh cadence as the rest.

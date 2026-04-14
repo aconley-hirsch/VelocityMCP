@@ -1,15 +1,47 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Pull in Microsoft.WindowsDesktop.App. VelocityAdapter.dll is a
+         .NETFramework 4.8 assembly that transitively references legacy
+         System.Security.* types (XmlSyntaxException et al). Those live in
+         System.Security.dll, which ships as part of the Windows Desktop
+         runtime, not the base Core runtime. -->
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(OS)' == 'Windows_NT'">
+    <DefineConstants>$(DefineConstants);VELOCITY_REAL</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="DuckDB.NET.Data.Full" Version="1.5.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.5" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.5" />
+  </ItemGroup>
+
+  <!-- Real Velocity SDK: Windows-only. Reference the vendored DLL and copy the
+       full SDK payload (transitive deps, satellite assemblies, native SNI DLLs,
+       and the .dll.config) into bin/ so the published service is self-contained. -->
+  <ItemGroup Condition="'$(OS)' == 'Windows_NT'">
+    <Reference Include="VelocityAdapter">
+      <HintPath>..\..\SDK\VelocityAdapter\VelocityAdapter.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <PackageReference Include="System.Data.SqlClient" Version="4.9.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(OS)' == 'Windows_NT'">
+    <Content Include="..\..\SDK\VelocityAdapter\**\*.dll" Exclude="..\..\SDK\VelocityAdapter\VelocityAdapter.dll">
+      <Link>%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\..\SDK\VelocityAdapter\VelocityAdapter.dll.config">
+      <Link>VelocityAdapter.dll.config</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
 </Project>
