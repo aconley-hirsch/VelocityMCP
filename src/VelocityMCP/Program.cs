@@ -113,7 +113,10 @@ IMcpServerBuilder AddMcpTools(IMcpServerBuilder mcpBuilder)
         .WithTools<GetDailyAttendanceTool>()
         .WithTools<FindForcedThroughAttemptsTool>()
         .WithTools<CheckAuthorizationTool>()
-        .WithTools<InactiveEntitiesTool>();
+        .WithTools<InactiveEntitiesTool>()
+        .WithTools<SearchAdminActionsTool>()
+        .WithTools<ListExpiringCredentialsTool>()
+        .WithTools<FindOperatorsTool>();
 }
 
 // ── HTTP/SSE mode ───────────────────────────────────────────────────

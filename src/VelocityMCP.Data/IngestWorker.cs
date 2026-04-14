@@ -54,6 +54,7 @@ public sealed class IngestWorker : BackgroundService
         // Backfill if no cursor exists
         await BackfillIfNeeded("Log_Transactions", stoppingToken);
         await BackfillIfNeeded("AlarmLog", stoppingToken);
+        await BackfillIfNeeded("Log_Software", stoppingToken);
 
         // Two parallel loops: facts (fast) + policy/dimensions (slow). Policy data
         // changes per-day, not per-second, so a 5-minute beat avoids hammering the
@@ -94,9 +95,16 @@ public sealed class IngestWorker : BackgroundService
             var people = await _sdk.GetPersonsAsync(ct);
             _mirror.UpsertPeople(people);
 
+            // Operators — must land BEFORE software-event ingest so the
+            // fact_software_events insert's correlated subquery can resolve
+            // operator_name from dim_operators. Small table on every site.
+            var operators = await _sdk.GetOperatorsAsync(ct);
+            _mirror.UpsertOperators(operators);
+
             // Credential→person mapping — required so transaction tools can
             // resolve fact_transactions.uid1 (a CredentialId) back to a real
             // HostUserId. Refreshed on the policy cadence like the dim tables.
+            // Also carries activation/expiration dates for list_expiring_credentials.
             var credentials = await _sdk.GetUserCredentialsAsync(ct);
             _mirror.UpsertUserCredentials(credentials);
 
@@ -167,6 +175,13 @@ public sealed class IngestWorker : BackgroundService
                     _mirror.IngestAlarms(inWindow);
                     count = inWindow.Count;
                 }
+                else if (sourceTable == "Log_Software")
+                {
+                    var records = await _sdk.GetSoftwareEventsAsync(sinceDate, ct);
+                    var inWindow = records.Where(r => r.DtDate >= chunkStart && r.DtDate < chunkEnd).ToList();
+                    _mirror.IngestSoftwareEvents(inWindow);
+                    count = inWindow.Count;
+                }
 
                 totalRows += count;
                 _logger.LogDebug("{Table}: backfill chunk {Start:d} → {End:d}: {Count} rows",
@@ -217,6 +232,17 @@ public sealed class IngestWorker : BackgroundService
                         if (batchMax > maxDt) maxDt = batchMax;
                     }
                 }
+                else if (sourceTable == "Log_Software")
+                {
+                    var records = await _sdk.GetSoftwareEventsAsync(sinceDate, ct);
+                    if (records.Count > 0)
+                    {
+                        _mirror.IngestSoftwareEvents(records);
+                        count = records.Count;
+                        var batchMax = records.Max(r => r.DtDate);
+                        if (batchMax > maxDt) maxDt = batchMax;
+                    }
+                }
                 else if (sourceTable == "AlarmLog")
                 {
                     var records = await _sdk.GetAlarmLogAsync(sinceDate, ct);
@@ -253,6 +279,7 @@ public sealed class IngestWorker : BackgroundService
     {
         await IngestTable("Log_Transactions", ct);
         await IngestTable("AlarmLog", ct);
+        await IngestTable("Log_Software", ct);
     }
 
     private async Task IngestTable(string sourceTable, CancellationToken ct)
@@ -290,6 +317,16 @@ public sealed class IngestWorker : BackgroundService
                     _mirror.IngestAlarms(records);
                     count = records.Count;
                     maxDt = records.Where(r => r.DtDate.HasValue).Max(r => r.DtDate!.Value);
+                }
+            }
+            else if (sourceTable == "Log_Software")
+            {
+                var records = await _sdk.GetSoftwareEventsAsync(sinceDate, ct);
+                if (records.Count > 0)
+                {
+                    _mirror.IngestSoftwareEvents(records);
+                    count = records.Count;
+                    maxDt = records.Max(r => r.DtDate);
                 }
             }
 

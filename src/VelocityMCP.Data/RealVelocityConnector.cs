@@ -109,6 +109,35 @@ public sealed class RealVelocityConnector : IVelocityClient
             return result;
         }, ct);
 
+    // Operator audit trail. Log_Software.Description is already human-readable,
+    // so we don't need an event-code lookup — we keep EventCode only for the
+    // `search_admin_actions` tool's scoped filtering. OperatorId is populated
+    // but NOT the operator name; that's denormalized at the mirror boundary
+    // from dim_operators after the fact.
+    public Task<List<SoftwareEventRecord>> GetSoftwareEventsAsync(DateTime sinceDate, CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var sdk = RequireConnected();
+            var rows = sdk.GetSoftwareEvents(sinceDate);
+            var result = new List<SoftwareEventRecord>(rows.Count);
+            foreach (var s in rows)
+            {
+                ct.ThrowIfCancellationRequested();
+                result.Add(new SoftwareEventRecord
+                {
+                    LogId = s.LogID,
+                    DtDate = s.EventTime,
+                    PcDateTime = s.PCDateTime,
+                    EventCode = s.Event,
+                    Description = s.Description ?? "",
+                    OperatorId = s.OperatorId,
+                    NetAddress = s.NetAddress,
+                    SecurityDomainId = s.SecurityDomainID,
+                });
+            }
+            return result;
+        }, ct);
+
     // ── Dimension getters ───────────────────────────────────────────────
 
     public Task<List<DoorRecord>> GetDoorsAsync(CancellationToken ct = default) =>
@@ -182,6 +211,8 @@ public sealed class RealVelocityConnector : IVelocityClient
     // CredentialId (from UserCredentials), NOT a HostUserId, so any tool that
     // wants to filter events by a real person has to expand person → list of
     // credentials first. One row per non-template credential.
+    // Activation/expiration dates come from HostActivationDate/HostExpirationDate;
+    // both are nullable (credentials can be open-ended / perpetual).
     public Task<List<UserCredentialRecord>> GetUserCredentialsAsync(CancellationToken ct = default) =>
         Task.Run(() =>
         {
@@ -191,7 +222,9 @@ public sealed class RealVelocityConnector : IVelocityClient
             using var lease = SqlLease.From(sdk);
             using var cmd = lease.CreateCommand();
             cmd.CommandText = @"
-                SELECT CredentialId, HostUserId
+                SELECT CredentialId, HostUserId,
+                       HostActivationDate, HostExpirationDate,
+                       HostIsActivated, HostExpirationUsed
                 FROM UserCredentials WITH (NOLOCK)
                 WHERE IsTemplate = 0 AND HostUserId IS NOT NULL AND HostUserId > 0";
             using var rd = cmd.ExecuteReader();
@@ -202,6 +235,41 @@ public sealed class RealVelocityConnector : IVelocityClient
                 {
                     CredentialId = rd.GetInt32(0),
                     PersonId = rd.GetInt32(1),
+                    ActivationDate = rd.IsDBNull(2) ? null : rd.GetDateTime(2),
+                    ExpirationDate = rd.IsDBNull(3) ? null : rd.GetDateTime(3),
+                    IsActivated = !rd.IsDBNull(4) && rd.GetBoolean(4),
+                    ExpirationUsed = !rd.IsDBNull(5) && rd.GetBoolean(5),
+                });
+            }
+            return result;
+        }, ct);
+
+    // Operator (admin user) directory. Small table on every real site
+    // (<20 rows typical). Used to resolve fact_software_events.operator_id
+    // to a human name and to power the find_operators tool.
+    public Task<List<OperatorRecord>> GetOperatorsAsync(CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var sdk = RequireConnected();
+            var result = new List<OperatorRecord>();
+
+            using var lease = SqlLease.From(sdk);
+            using var cmd = lease.CreateCommand();
+            cmd.CommandText = @"
+                SELECT OperatorID, Name, FullName, Description, Enabled
+                FROM Operators WITH (NOLOCK)
+                ORDER BY OperatorID";
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                ct.ThrowIfCancellationRequested();
+                result.Add(new OperatorRecord
+                {
+                    OperatorId = rd.GetInt32(0),
+                    Name = rd.IsDBNull(1) ? "" : rd.GetString(1),
+                    FullName = rd.IsDBNull(2) ? null : rd.GetString(2),
+                    Description = rd.IsDBNull(3) ? null : rd.GetString(3),
+                    Enabled = !rd.IsDBNull(4) && rd.GetBoolean(4),
                 });
             }
             return result;

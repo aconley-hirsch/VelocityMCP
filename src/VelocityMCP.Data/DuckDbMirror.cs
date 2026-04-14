@@ -155,6 +155,54 @@ public sealed class DuckDbMirror : IDisposable
         }
     }
 
+    /// <summary>
+    /// Append a batch of admin-action events to fact_software_events. Idempotent
+    /// via INSERT OR IGNORE on log_id. operator_name is denormalized against
+    /// dim_operators at insert time using a correlated subquery — this keeps
+    /// the audit rows self-describing even if dim_operators changes later.
+    /// </summary>
+    public void IngestSoftwareEvents(IReadOnlyList<Models.SoftwareEventRecord> records)
+    {
+        if (records.Count == 0) return;
+
+        using var tx = _conn.BeginTransaction();
+        try
+        {
+            foreach (var r in records)
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = """
+                    INSERT OR IGNORE INTO fact_software_events (
+                        log_id, dt_date, pc_date_time, event_code, description,
+                        operator_id, operator_name, net_address, security_domain_id
+                    ) VALUES (
+                        $log_id, $dt_date, $pc_date_time, $event_code, $description,
+                        $operator_id,
+                        (SELECT name FROM dim_operators WHERE operator_id = $operator_id),
+                        $net_address, $security_domain_id
+                    )
+                    """;
+                cmd.Parameters.Add(new DuckDBParameter("log_id", r.LogId));
+                cmd.Parameters.Add(new DuckDBParameter("dt_date", r.DtDate));
+                cmd.Parameters.Add(new DuckDBParameter("pc_date_time", (object?)r.PcDateTime ?? DBNull.Value));
+                cmd.Parameters.Add(new DuckDBParameter("event_code", r.EventCode));
+                cmd.Parameters.Add(new DuckDBParameter("description", r.Description));
+                cmd.Parameters.Add(new DuckDBParameter("operator_id", (object?)r.OperatorId ?? DBNull.Value));
+                cmd.Parameters.Add(new DuckDBParameter("net_address", (object?)r.NetAddress ?? DBNull.Value));
+                cmd.Parameters.Add(new DuckDBParameter("security_domain_id", (object?)r.SecurityDomainId ?? DBNull.Value));
+                cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+            _logger.LogDebug("Ingested {Count} software events", records.Count);
+        }
+        catch
+        {
+            tx.Rollback();
+            throw;
+        }
+    }
+
     // ── Cursor management ───────────────────────────────────────────────
 
     public DateTime? GetCursor(string sourceTable)
@@ -238,18 +286,22 @@ public sealed class DuckDbMirror : IDisposable
                 (SELECT COUNT(*) FROM dim_doors),
                 (SELECT COUNT(*) FROM dim_readers),
                 (SELECT COUNT(*) FROM dim_clearances),
+                (SELECT COUNT(*) FROM dim_operators),
                 (SELECT COUNT(*) FROM fact_transactions),
-                (SELECT COUNT(*) FROM fact_alarms)
+                (SELECT COUNT(*) FROM fact_alarms),
+                (SELECT COUNT(*) FROM fact_software_events)
             """;
         using var rd = cmd.ExecuteReader();
         rd.Read();
         return new DimensionCounts(
-            People:       rd.GetInt64(0),
-            Doors:        rd.GetInt64(1),
-            Readers:      rd.GetInt64(2),
-            Clearances:   rd.GetInt64(3),
-            Transactions: rd.GetInt64(4),
-            Alarms:       rd.GetInt64(5));
+            People:         rd.GetInt64(0),
+            Doors:          rd.GetInt64(1),
+            Readers:        rd.GetInt64(2),
+            Clearances:     rd.GetInt64(3),
+            Operators:      rd.GetInt64(4),
+            Transactions:   rd.GetInt64(5),
+            Alarms:         rd.GetInt64(6),
+            SoftwareEvents: rd.GetInt64(7));
     }
 
     public long CountTransactions(DateTime since, DateTime until, int? eventCode = null,
@@ -1115,16 +1167,60 @@ public sealed class DuckDbMirror : IDisposable
             using var cmd = _conn.CreateCommand();
             cmd.Transaction = tx;
             cmd.CommandText = """
-                INSERT INTO dim_user_credentials (credential_id, person_id, updated_at)
-                VALUES ($cid, $pid, $now)
+                INSERT INTO dim_user_credentials (
+                    credential_id, person_id,
+                    activation_date, expiration_date, is_activated, expiration_used,
+                    updated_at
+                )
+                VALUES (
+                    $cid, $pid,
+                    $act, $exp, $is_act, $exp_used,
+                    $now
+                )
                 """;
             cmd.Parameters.Add(new DuckDBParameter("cid", c.CredentialId));
             cmd.Parameters.Add(new DuckDBParameter("pid", c.PersonId));
+            cmd.Parameters.Add(new DuckDBParameter("act", (object?)c.ActivationDate ?? DBNull.Value));
+            cmd.Parameters.Add(new DuckDBParameter("exp", (object?)c.ExpirationDate ?? DBNull.Value));
+            cmd.Parameters.Add(new DuckDBParameter("is_act", c.IsActivated));
+            cmd.Parameters.Add(new DuckDBParameter("exp_used", c.ExpirationUsed));
             cmd.Parameters.Add(new DuckDBParameter("now", DateTime.UtcNow));
             cmd.ExecuteNonQuery();
         }
         tx.Commit();
         _logger.LogInformation("Upserted {Count} user credentials", credentials.Count);
+    }
+
+    public void UpsertOperators(IReadOnlyList<Models.OperatorRecord> operators)
+    {
+        if (operators.Count == 0) return;
+        using var tx = _conn.BeginTransaction();
+        // Same authoritative-replace pattern as credentials: operators get
+        // added/removed in the source system, and we don't want stale rows.
+        using (var clr = _conn.CreateCommand())
+        {
+            clr.Transaction = tx;
+            clr.CommandText = "DELETE FROM dim_operators";
+            clr.ExecuteNonQuery();
+        }
+        foreach (var o in operators)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                INSERT INTO dim_operators (operator_id, name, full_name, description, enabled, updated_at)
+                VALUES ($id, $name, $full, $desc, $enabled, $now)
+                """;
+            cmd.Parameters.Add(new DuckDBParameter("id", o.OperatorId));
+            cmd.Parameters.Add(new DuckDBParameter("name", o.Name));
+            cmd.Parameters.Add(new DuckDBParameter("full", (object?)o.FullName ?? DBNull.Value));
+            cmd.Parameters.Add(new DuckDBParameter("desc", (object?)o.Description ?? DBNull.Value));
+            cmd.Parameters.Add(new DuckDBParameter("enabled", o.Enabled));
+            cmd.Parameters.Add(new DuckDBParameter("now", DateTime.UtcNow));
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+        _logger.LogInformation("Upserted {Count} operators", operators.Count);
     }
 
     // ── Dimension fuzzy search ──────────────────────────────────────────
@@ -1218,6 +1314,186 @@ public sealed class DuckDbMirror : IDisposable
                 reader.IsDBNull(1) ? null : reader.GetString(1),
                 reader.IsDBNull(2) ? null : reader.GetString(2),
                 reader.GetString(3)));
+        }
+        return results;
+    }
+
+    public List<OperatorMatch> SearchOperators(string query, int limit)
+    {
+        var results = new List<OperatorMatch>();
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT operator_id, name, full_name, description, enabled
+            FROM dim_operators
+            WHERE name ILIKE $pattern
+               OR full_name ILIKE $pattern
+               OR description ILIKE $pattern
+            ORDER BY LENGTH(name), name
+            LIMIT $limit
+            """;
+        cmd.Parameters.Add(new DuckDBParameter("pattern", $"%{query}%"));
+        cmd.Parameters.Add(new DuckDBParameter("limit", limit));
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            results.Add(new OperatorMatch(
+                OperatorId: reader.GetInt32(0),
+                Name: reader.GetString(1),
+                FullName: reader.IsDBNull(2) ? null : reader.GetString(2),
+                Description: reader.IsDBNull(3) ? null : reader.GetString(3),
+                Enabled: !reader.IsDBNull(4) && reader.GetBoolean(4)));
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Backing query for search_admin_actions. Combines count + row sample
+    /// in two statements so the tool can report `total_matching` alongside
+    /// the bounded `events` list. All filters are optional; when none are
+    /// set this returns the most recent N events in the window.
+    /// descriptionQuery does a case-insensitive partial match — passing
+    /// "Server Room" matches any row whose description contains that phrase,
+    /// which is how the model will answer topical audit-trail questions
+    /// without needing to know event codes.
+    /// </summary>
+    public (long TotalMatching, List<SoftwareEventRow> Events) SampleSoftwareEvents(
+        DateTime since, DateTime until,
+        int? operatorId, int? eventCode, string? descriptionQuery,
+        string order, int limit)
+    {
+        var where = "WHERE dt_date >= $since AND dt_date < $until";
+        var parameters = new List<DuckDBParameter>
+        {
+            new("since", since),
+            new("until", until),
+        };
+
+        if (operatorId.HasValue)
+        {
+            where += " AND operator_id = $op_id";
+            parameters.Add(new DuckDBParameter("op_id", operatorId.Value));
+        }
+        if (eventCode.HasValue)
+        {
+            where += " AND event_code = $event_code";
+            parameters.Add(new DuckDBParameter("event_code", eventCode.Value));
+        }
+        if (!string.IsNullOrWhiteSpace(descriptionQuery))
+        {
+            where += " AND description ILIKE $desc_pattern";
+            parameters.Add(new DuckDBParameter("desc_pattern", $"%{descriptionQuery}%"));
+        }
+
+        long totalMatching;
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = $"SELECT COUNT(*) FROM fact_software_events {where}";
+            foreach (var p in parameters) cmd.Parameters.Add(p);
+            totalMatching = (long)cmd.ExecuteScalar()!;
+        }
+
+        var orderSql = order.Equals("time_asc", StringComparison.OrdinalIgnoreCase) ? "dt_date ASC" : "dt_date DESC";
+        var events = new List<SoftwareEventRow>();
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = $"""
+                SELECT log_id, dt_date, event_code, description,
+                       operator_id, operator_name, net_address
+                FROM fact_software_events {where}
+                ORDER BY {orderSql}
+                LIMIT $limit
+                """;
+            foreach (var p in parameters) cmd.Parameters.Add(p);
+            cmd.Parameters.Add(new DuckDBParameter("limit", limit));
+            using var rd = cmd.ExecuteReader();
+            while (rd.Read())
+            {
+                events.Add(new SoftwareEventRow(
+                    LogId:        rd.GetInt32(0),
+                    DtDate:       rd.GetDateTime(1),
+                    EventCode:    rd.GetInt32(2),
+                    Description:  rd.GetString(3),
+                    OperatorId:   rd.IsDBNull(4) ? null : rd.GetInt32(4),
+                    OperatorName: rd.IsDBNull(5) ? null : rd.GetString(5),
+                    NetAddress:   rd.IsDBNull(6) ? null : rd.GetString(6)));
+            }
+        }
+
+        return (totalMatching, events);
+    }
+
+    /// <summary>
+    /// Backing query for list_expiring_credentials. Returns credentials whose
+    /// expiration_date falls within the requested lookahead, optionally also
+    /// including already-expired and/or perpetual (no-expiration) credentials.
+    /// Rows are joined through dim_people so the model gets a readable name
+    /// per credential. Perpetual rows are emitted with expiration_date=null
+    /// and days_until_expiry=null — callers must handle the "no expiration"
+    /// case explicitly in the response shape.
+    /// </summary>
+    public List<ExpiringCredentialRow> ListExpiringCredentials(
+        int withinDays, bool includeExpired, bool includePerpetual,
+        long? personId, int limit)
+    {
+        var now = DateTime.UtcNow;
+        var lookahead = now.AddDays(withinDays);
+
+        // Three candidate sets unioned based on caller flags. Always include
+        // "expiring within window" (the primary use case). Optionally add
+        // already-expired and perpetual. Single SQL so pagination/limit
+        // applies to the combined set in one sort pass.
+        var clauses = new List<string>
+        {
+            "(expiration_date IS NOT NULL AND expiration_date >= $now AND expiration_date <= $lookahead)"
+        };
+        if (includeExpired)
+            clauses.Add("(expiration_date IS NOT NULL AND expiration_date < $now)");
+        if (includePerpetual)
+            clauses.Add("(expiration_date IS NULL)");
+
+        var where = "(" + string.Join(" OR ", clauses) + ")";
+        if (personId.HasValue)
+            where += " AND c.person_id = $pid";
+
+        var results = new List<ExpiringCredentialRow>();
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT c.credential_id, c.person_id, p.full_name,
+                   c.activation_date, c.expiration_date,
+                   c.is_activated, c.expiration_used
+            FROM dim_user_credentials c
+            LEFT JOIN dim_people p ON p.person_id = c.person_id
+            WHERE {where}
+            ORDER BY
+                -- Perpetual rows (NULL expiration) sort last; within-window
+                -- rows sort by expiration ASC (soonest first); already-expired
+                -- rows naturally sort ahead of future expirations.
+                c.expiration_date IS NULL,
+                c.expiration_date ASC
+            LIMIT $limit
+            """;
+        cmd.Parameters.Add(new DuckDBParameter("now", now));
+        cmd.Parameters.Add(new DuckDBParameter("lookahead", lookahead));
+        if (personId.HasValue)
+            cmd.Parameters.Add(new DuckDBParameter("pid", personId.Value));
+        cmd.Parameters.Add(new DuckDBParameter("limit", limit));
+
+        using var rd = cmd.ExecuteReader();
+        while (rd.Read())
+        {
+            var expiration = rd.IsDBNull(4) ? (DateTime?)null : rd.GetDateTime(4);
+            int? daysUntil = expiration.HasValue
+                ? (int)Math.Round((expiration.Value - now).TotalDays)
+                : null;
+            results.Add(new ExpiringCredentialRow(
+                CredentialId:     rd.GetInt32(0),
+                PersonId:         rd.GetInt32(1),
+                PersonName:       rd.IsDBNull(2) ? null : rd.GetString(2),
+                ActivationDate:   rd.IsDBNull(3) ? null : rd.GetDateTime(3),
+                ExpirationDate:   expiration,
+                IsActivated:      !rd.IsDBNull(5) && rd.GetBoolean(5),
+                ExpirationUsed:   !rd.IsDBNull(6) && rd.GetBoolean(6),
+                DaysUntilExpiry:  daysUntil));
         }
         return results;
     }
@@ -2831,13 +3107,41 @@ public record DoorMatch(int DoorId, string Name, string? ControllerAddr, List<st
 public record ReaderMatch(int ReaderId, string Name);
 public record PersonMatch(int PersonId, string? FirstName, string? LastName, string FullName);
 
+public record OperatorMatch(
+    int OperatorId,
+    string Name,
+    string? FullName,
+    string? Description,
+    bool Enabled);
+
+public record SoftwareEventRow(
+    int LogId,
+    DateTime DtDate,
+    int EventCode,
+    string Description,
+    int? OperatorId,
+    string? OperatorName,
+    string? NetAddress);
+
+public record ExpiringCredentialRow(
+    int CredentialId,
+    int PersonId,
+    string? PersonName,
+    DateTime? ActivationDate,
+    DateTime? ExpirationDate,
+    bool IsActivated,
+    bool ExpirationUsed,
+    int? DaysUntilExpiry);
+
 public record DimensionCounts(
     long People,
     long Doors,
     long Readers,
     long Clearances,
+    long Operators,
     long Transactions,
-    long Alarms);
+    long Alarms,
+    long SoftwareEvents);
 
 public record AggregationBucket(string? Key, long? KeyId, long Count);
 public record AggregationResult(

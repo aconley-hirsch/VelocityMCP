@@ -40,6 +40,9 @@ public sealed class FakeVelocityClient : IVelocityClient
     private static readonly string[] LastNames =
         ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Martinez", "Wilson"];
 
+    private static readonly string[] OperatorNames =
+        ["Administrator", "SecurityOps", "FacilitiesAdmin", "AuditorReadOnly"];
+
     private static readonly (int Code, string Description, int Disposition)[] EventTypes =
     [
         (1, "Access Granted", 1),
@@ -55,6 +58,7 @@ public sealed class FakeVelocityClient : IVelocityClient
     private readonly Random _rng = new(42); // deterministic seed for reproducibility
     private int _nextLogId = 1;
     private int _nextAlarmId = 1;
+    private int _nextSoftwareId = 1;
     private bool _connected;
 
     public bool IsConnected => _connected;
@@ -112,6 +116,56 @@ public sealed class FakeVelocityClient : IVelocityClient
                 Uid2Name = null,
                 ServerID = 1,
                 SecurityDomainID = 1
+            });
+        }
+
+        return Task.FromResult(records);
+    }
+
+    // Hand-picked audit-trail templates. Descriptions mirror real Velocity
+    // Log_Software text so the admin-actions search tool produces realistic
+    // output against the fake client.
+    private static readonly (int Code, string Template)[] SoftwareEventTemplates =
+    [
+        (1022, "Operator {op} logged on to workstation VELOCITY-WS1"),
+        (1031, "Operator {op} disconnected from workstation VELOCITY-WS1"),
+        (1037, "Credential {num}: HID-STANDARD was added by {op}"),
+        (1039, "Credential {num} was changed by {op}"),
+        (1040, "Person {name} was added by {op}"),
+        (1041, "Person {name} was changed by {op}"),
+        (1050, "Door Group {num}: Business Hours was modified by {op}"),
+    ];
+
+    public Task<List<SoftwareEventRecord>> GetSoftwareEventsAsync(DateTime sinceDate, CancellationToken ct = default)
+    {
+        var records = new List<SoftwareEventRecord>();
+        var now = DateTime.UtcNow;
+
+        int count = _rng.Next(10, 25);
+        for (int i = 0; i < count; i++)
+        {
+            var ticksRange = now.Ticks - sinceDate.Ticks;
+            if (ticksRange <= 0) break;
+            var dt = sinceDate.AddTicks(_rng.NextInt64(0, ticksRange));
+
+            var template = SoftwareEventTemplates[_rng.Next(SoftwareEventTemplates.Length)];
+            var opIdx = _rng.Next(OperatorNames.Length);
+            var personIdx = _rng.Next(FirstNames.Length);
+            var description = template.Template
+                .Replace("{op}", OperatorNames[opIdx])
+                .Replace("{num}", (5000 + _rng.Next(100)).ToString())
+                .Replace("{name}", $"{FirstNames[personIdx]} {LastNames[personIdx]}");
+
+            records.Add(new SoftwareEventRecord
+            {
+                LogId = _nextSoftwareId++,
+                DtDate = dt,
+                PcDateTime = dt,
+                EventCode = template.Code,
+                Description = description,
+                OperatorId = 1 + opIdx,
+                NetAddress = $"10.0.1.{50 + opIdx}",
+                SecurityDomainId = 1,
             });
         }
 
@@ -220,17 +274,62 @@ public sealed class FakeVelocityClient : IVelocityClient
     // Fake 1:1 credential-to-person mapping — one badge per person, CredentialId
     // deliberately offset from PersonId so tests catch code that assumes they're
     // the same number space.
+    // Expiration mix: first 2 credentials expire in the past (so list_expiring
+    // can surface them with include_expired=true), next 3 expire within 14
+    // days (the default "expiring soon" window), next 2 expire in ~6 months
+    // (not soon), remainder perpetual (no expiration date).
     public Task<List<UserCredentialRecord>> GetUserCredentialsAsync(CancellationToken ct = default)
     {
+        var now = DateTime.UtcNow;
         var creds = FirstNames
             .Zip(LastNames)
-            .Select((_, i) => new UserCredentialRecord
+            .Select((_, i) =>
             {
-                CredentialId = 5000 + i,
-                PersonId = 1000 + i,
+                DateTime? activation = now.AddMonths(-6);
+                DateTime? expiration = i switch
+                {
+                    0 or 1 => now.AddDays(-7 - i),        // already expired
+                    2 or 3 or 4 => now.AddDays(3 + i),    // expiring within 14 days
+                    5 or 6 => now.AddMonths(6),           // not soon
+                    _ => (DateTime?)null,                 // perpetual
+                };
+                return new UserCredentialRecord
+                {
+                    CredentialId = 5000 + i,
+                    PersonId = 1000 + i,
+                    ActivationDate = activation,
+                    ExpirationDate = expiration,
+                    IsActivated = true,
+                    ExpirationUsed = expiration.HasValue,
+                };
             })
             .ToList();
         return Task.FromResult(creds);
+    }
+
+    // Fake operator directory — one active admin per hand-picked name.
+    // OperatorId matches the index used in GetSoftwareEventsAsync so the
+    // admin-actions audit trail and dim_operators join correctly in tests.
+    public Task<List<OperatorRecord>> GetOperatorsAsync(CancellationToken ct = default)
+    {
+        var operators = OperatorNames
+            .Select((name, i) => new OperatorRecord
+            {
+                OperatorId = 1 + i,
+                Name = name,
+                FullName = name switch
+                {
+                    "Administrator" => "System Administrator",
+                    "SecurityOps" => "Security Operations",
+                    "FacilitiesAdmin" => "Facilities Administrator",
+                    "AuditorReadOnly" => "Read-Only Auditor",
+                    _ => name
+                },
+                Description = i == 0 ? "Full Access" : "Limited Access",
+                Enabled = true,
+            })
+            .ToList();
+        return Task.FromResult(operators);
     }
 
     // ── Authorization / clearance seed data ─────────────────────────────

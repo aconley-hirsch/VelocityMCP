@@ -14,10 +14,12 @@ public interface IVelocityClient : IDisposable
 
     Task<List<TransactionRecord>> GetLogTransactionsAsync(DateTime sinceDate, CancellationToken ct = default);
     Task<List<AlarmRecord>> GetAlarmLogAsync(DateTime sinceDate, CancellationToken ct = default);
+    Task<List<SoftwareEventRecord>> GetSoftwareEventsAsync(DateTime sinceDate, CancellationToken ct = default);
 
     Task<List<DoorRecord>> GetDoorsAsync(CancellationToken ct = default);
     Task<List<ReaderRecord>> GetReadersAsync(CancellationToken ct = default);
     Task<List<PersonRecord>> GetPersonsAsync(CancellationToken ct = default);
+    Task<List<OperatorRecord>> GetOperatorsAsync(CancellationToken ct = default);
     Task<List<UserCredentialRecord>> GetUserCredentialsAsync(CancellationToken ct = default);
 
     // ── Authorization / policy dimensions ──────────────────────────────

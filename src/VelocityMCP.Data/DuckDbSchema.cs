@@ -35,8 +35,10 @@ public sealed class DuckDbSchema
 
         CreateFactTransactions(conn);
         CreateFactAlarms(conn);
+        CreateFactSoftwareEvents(conn);
         CreateMetaTables(conn);
         CreateDimensionTables(conn);
+        MigrateDimensionTables(conn);
         CreateLookupTables(conn);
         SeedLookupTables(conn);
 
@@ -53,7 +55,7 @@ public sealed class DuckDbSchema
         using var conn = new DuckDBConnection(_connectionString);
         conn.Open();
 
-        string[] factTables = ["fact_transactions", "fact_alarms"];
+        string[] factTables = ["fact_transactions", "fact_alarms", "fact_software_events"];
 
         foreach (var table in factTables)
         {
@@ -150,6 +152,49 @@ public sealed class DuckDbSchema
             CREATE INDEX IF NOT EXISTS idx_al_dt_date   ON fact_alarms(dt_date);
             CREATE INDEX IF NOT EXISTS idx_al_event_id  ON fact_alarms(event_id);
             CREATE INDEX IF NOT EXISTS idx_al_uid1      ON fact_alarms(uid1);
+            """;
+        cmd.ExecuteNonQuery();
+    }
+
+    // Audit / operator-action trail. Mirrors Velocity's Log_Software table,
+    // which records every administrative change (credential added, clearance
+    // modified, operator login, etc.). The `description` column is already
+    // human-readable in the source, so we don't need a lookup-table join for
+    // the event code — we keep event_code for scoped filtering only.
+    private static void CreateFactSoftwareEvents(DuckDBConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            CREATE TABLE IF NOT EXISTS fact_software_events (
+                log_id              INTEGER PRIMARY KEY,
+                dt_date             TIMESTAMP NOT NULL,       -- EventTime from source
+                pc_date_time        TIMESTAMP,
+                event_code          INTEGER NOT NULL,
+                description         VARCHAR NOT NULL,
+                operator_id         INTEGER,
+                operator_name       VARCHAR,                  -- denormalized at ingest
+                net_address         VARCHAR,
+                security_domain_id  INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_sw_dt_date  ON fact_software_events(dt_date);
+            CREATE INDEX IF NOT EXISTS idx_sw_operator ON fact_software_events(operator_id);
+            CREATE INDEX IF NOT EXISTS idx_sw_event    ON fact_software_events(event_code);
+            """;
+        cmd.ExecuteNonQuery();
+    }
+
+    // Idempotent ALTER pass for dim tables that gained columns after the
+    // initial schema was created. DuckDB's "ADD COLUMN IF NOT EXISTS" lets
+    // us extend existing mirror files without forcing users to delete and
+    // re-ingest. New columns are nullable so existing rows remain valid.
+    private static void MigrateDimensionTables(DuckDBConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            ALTER TABLE dim_user_credentials ADD COLUMN IF NOT EXISTS activation_date TIMESTAMP;
+            ALTER TABLE dim_user_credentials ADD COLUMN IF NOT EXISTS expiration_date TIMESTAMP;
+            ALTER TABLE dim_user_credentials ADD COLUMN IF NOT EXISTS is_activated BOOLEAN;
+            ALTER TABLE dim_user_credentials ADD COLUMN IF NOT EXISTS expiration_used BOOLEAN;
             """;
         cmd.ExecuteNonQuery();
     }
@@ -320,6 +365,19 @@ public sealed class DuckDbSchema
                 last_name       VARCHAR,
                 full_name       VARCHAR,
                 active          BOOLEAN DEFAULT TRUE,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Velocity operators (admins / workstation users). Small table on
+            -- every real site (usually <20 rows), refreshed on the policy
+            -- cadence. Used to resolve fact_software_events.operator_id to
+            -- a human name and to power find_operators for audit-trail lookups.
+            CREATE TABLE IF NOT EXISTS dim_operators (
+                operator_id     INTEGER PRIMARY KEY,
+                name            VARCHAR NOT NULL,
+                full_name       VARCHAR,
+                description     VARCHAR,
+                enabled         BOOLEAN DEFAULT TRUE,
                 updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
