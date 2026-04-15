@@ -210,6 +210,59 @@ public class ListExpiringCredentialsToolTests : IDisposable
         Assert.All(creds, c => Assert.Equal("Alice Anderson", c.PersonName));
     }
 
+    [Fact]
+    public void OrphanPerson_NoCredentialsAtAll_ReturnsEmptyListNotThrow()
+    {
+        // Edge case: a person seeded in dim_people but with zero credentials
+        // in dim_user_credentials. ListExpiringCredentials(person_id=X) must
+        // handle this gracefully — empty list, not exception.
+        const int OrphanPersonId = 999;
+        _mirror.UpsertPeople(new List<PersonRecord>
+        {
+            new() { PersonId = OrphanPersonId, FirstName = "Lonely", LastName = "Person" },
+        });
+        // Note: deliberately NOT calling UpsertUserCredentials with a row for
+        // OrphanPersonId. The DB has the person but no credentials linked.
+
+        var json = ListExpiringCredentialsTool.ListExpiringCredentials(
+            _mirror,
+            include_expired: true,
+            include_perpetual: true,
+            person_id: OrphanPersonId);
+        var creds = ParseCredentials(json);
+
+        Assert.Empty(creds);
+    }
+
+    [Fact]
+    public void NonexistentPerson_ReturnsEmptyList()
+    {
+        // Caller passes a person_id that doesn't exist in dim_people at all
+        // — should not throw, should not return rows for some other person,
+        // should return empty.
+        var json = ListExpiringCredentialsTool.ListExpiringCredentials(
+            _mirror,
+            include_expired: true,
+            include_perpetual: true,
+            person_id: 999_999);
+        var creds = ParseCredentials(json);
+
+        Assert.Empty(creds);
+    }
+
+    [Fact]
+    public void NoFlags_NoData_ReturnsEmptyListNotThrow()
+    {
+        // Someone calls list_expiring_credentials with within_days=1 against
+        // a fixture where no credential expires that soon. Should return an
+        // empty list, not throw.
+        var json = ListExpiringCredentialsTool.ListExpiringCredentials(
+            _mirror, within_days: 1);
+        var creds = ParseCredentials(json);
+
+        Assert.Empty(creds);
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────
 
     private record CredentialRow(

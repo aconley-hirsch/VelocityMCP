@@ -2569,20 +2569,28 @@ public sealed class DuckDbMirror : IDisposable
             readerInClause = $"reader_name IN ({string.Join(", ", names)})";
         }
 
-        // Summary: total_access, total_denied, distinct_people, first/last seen
+        // Summary: total_access, total_denied, distinct_people, first/last seen.
+        // distinct_people MUST count real HostUserIds via the credentials join —
+        // not raw uid1 values, which are CredentialIds. The composite group key
+        // ('person:N' for matched, 'cred:N' for orphans) is the same shape we
+        // use in AggregateTransactionsByPerson and GetDailyAttendance: a person
+        // with two badges counts as one, an orphan credential counts as one.
         long totalAccess, totalDenied, distinctPeople;
         DateTime? firstSeen, lastSeen;
+        // Reader-name filter has to be re-prefixed with t. when we add the join.
+        var readerInClauseT = readerInClause.Replace("reader_name", "t.reader_name");
         using (var cmd = _conn.CreateCommand())
         {
             cmd.CommandText = $"""
                 SELECT
-                  COUNT(*) FILTER (WHERE disposition = 1),
-                  COUNT(*) FILTER (WHERE disposition > 1),
-                  COUNT(DISTINCT uid1),
-                  MIN(dt_date),
-                  MAX(dt_date)
-                FROM fact_transactions
-                WHERE dt_date >= $since AND dt_date < $until AND {readerInClause}
+                  COUNT(*) FILTER (WHERE t.disposition = 1),
+                  COUNT(*) FILTER (WHERE t.disposition > 1),
+                  COUNT(DISTINCT COALESCE('person:' || CAST(c.person_id AS VARCHAR), 'cred:' || CAST(t.uid1 AS VARCHAR))),
+                  MIN(t.dt_date),
+                  MAX(t.dt_date)
+                FROM fact_transactions t
+                LEFT JOIN dim_user_credentials c ON c.credential_id = t.uid1
+                WHERE t.dt_date >= $since AND t.dt_date < $until AND {readerInClauseT}
                 """;
             cmd.Parameters.Add(new DuckDBParameter("since", since));
             cmd.Parameters.Add(new DuckDBParameter("until", until));
@@ -2645,15 +2653,29 @@ public sealed class DuckDbMirror : IDisposable
                 .First();
         }
 
-        // Top users
+        // Top users — rolls up through credentials → people. A person with
+        // two badges who used both at this door counts as ONE row with the
+        // combined event count, not two separate rows. Same composite group
+        // key + MAX() aggregation pattern as AggregateTransactionsByPerson.
+        // For matched rows PersonId is the real HostUserId; for orphans it's
+        // -uid1 (negative as a marker that the row is unresolved).
         var topUsers = new List<PersonCountRow>();
         using (var cmd = _conn.CreateCommand())
         {
             cmd.CommandText = $"""
-                SELECT uid1, uid1_name, COUNT(*) AS cnt
-                FROM fact_transactions
-                WHERE dt_date >= $since AND dt_date < $until AND {readerInClause}
-                GROUP BY uid1, uid1_name
+                SELECT
+                    COALESCE(MAX(c.person_id), -MAX(t.uid1)) AS person_id,
+                    COALESCE(
+                        MAX(p.full_name),
+                        MAX(t.uid1_name),
+                        'Unknown credential ' || CAST(MAX(t.uid1) AS VARCHAR)
+                    ) AS person_name,
+                    COUNT(*) AS cnt
+                FROM fact_transactions t
+                LEFT JOIN dim_user_credentials c ON c.credential_id = t.uid1
+                LEFT JOIN dim_people p ON p.person_id = c.person_id
+                WHERE t.dt_date >= $since AND t.dt_date < $until AND {readerInClauseT}
+                GROUP BY COALESCE('person:' || CAST(c.person_id AS VARCHAR), 'cred:' || CAST(t.uid1 AS VARCHAR))
                 ORDER BY cnt DESC
                 LIMIT $limit
                 """;
