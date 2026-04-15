@@ -1,7 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!-- Must match the referenced projects (which target net8.0-windows
+         to pull in Microsoft.WindowsDesktop.App for the Identiv SDK
+         compat shims). RollForward LatestMajor lets the suite run on
+         the host's .NET 10 runtime when net8 isn't installed. -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RollForward>LatestMajor</RollForward>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 

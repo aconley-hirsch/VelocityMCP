@@ -93,7 +93,7 @@ public class EndToEndTests : IDisposable
             since: DateTime.UtcNow.AddHours(-6),
             until: DateTime.UtcNow,
             eventCode: null, readerName: null, readerNames: null,
-            uid1: null, disposition: null);
+            personId: null, disposition: null);
 
         // 6 hours → at least 6 contiguous buckets (may be 6 or 7 depending on clock boundary)
         Assert.InRange(result.Points.Count, 6, 7);
@@ -295,12 +295,15 @@ public class EndToEndTests : IDisposable
 
         var personIdFromAlarm = alarmSample.Alarms.First(a => a.PersonId.HasValue).PersonId!.Value;
 
-        // Feed that same long value into a transaction count — must work without casts/conversions
+        // Feed the same long value into both tool surfaces. This is a type/signature
+        // compatibility test, not a semantic equality test: after the credential→person
+        // rename, transactions interpret personId as a HostUserId (expanded through
+        // dim_user_credentials) while alarms still match uid1 directly. Both signatures
+        // accept long?, which is what we're checking.
         var txCount = mirror.CountTransactions(
             DateTime.UtcNow.AddDays(-1), DateTime.UtcNow.AddDays(1),
-            uid1: personIdFromAlarm);
+            personId: personIdFromAlarm);
 
-        // Sanity: same value works in alarm count too
         var alarmCount = mirror.CountAlarms(
             DateTime.UtcNow.AddDays(-1), DateTime.UtcNow.AddDays(1),
             null, null, null, personIdFromAlarm, null);
@@ -319,10 +322,13 @@ public class EndToEndTests : IDisposable
         using var mirror = new DuckDbMirror(_connString, NullLogger<DuckDbMirror>.Instance);
         using var client = new FakeVelocityClient();
 
-        // Populate dimensions + ingest one hour of activity
+        // Populate dimensions + ingest one hour of activity. Credentials must
+        // be seeded so the inactive-entities "person" branch can actually
+        // resolve fact_transactions.uid1 (a credential) back to a HostUserId.
         mirror.UpsertDoors(client.GetDoorsAsync().Result);
         mirror.UpsertReaders(client.GetReadersAsync().Result);
         mirror.UpsertPeople(client.GetPersonsAsync().Result);
+        mirror.UpsertUserCredentials(client.GetUserCredentialsAsync().Result);
         mirror.IngestTransactions(client.GetLogTransactionsAsync(DateTime.UtcNow.AddHours(-1)).Result);
 
         // For each entity type: active + inactive must equal total
@@ -347,7 +353,7 @@ public class EndToEndTests : IDisposable
                 {
                     var count = mirror.CountTransactions(
                         DateTime.UtcNow.AddDays(-1), DateTime.UtcNow.AddDays(1),
-                        uid1: item.Id);
+                        personId: item.Id);
                     Assert.Equal(0, count);
                 }
             }
@@ -364,6 +370,11 @@ public class EndToEndTests : IDisposable
         using var client = new FakeVelocityClient();
 
         mirror.UpsertPeople(client.GetPersonsAsync().Result);
+        // Inactive-entities query for "person" joins fact_transactions through
+        // dim_user_credentials → dim_people, so we have to seed the credentials
+        // dim or every person looks inactive (because none of the uid1 values
+        // in fact_transactions resolve to a person).
+        mirror.UpsertUserCredentials(client.GetUserCredentialsAsync().Result);
         // Ingest events from 2-3 hours ago — these are OUTSIDE a 1-hour-ago window
         mirror.IngestTransactions(client.GetLogTransactionsAsync(DateTime.UtcNow.AddHours(-3)).Result);
 
@@ -489,16 +500,30 @@ public class EndToEndTests : IDisposable
         mirror.UpsertDoors(client.GetDoorsAsync().Result);
         mirror.UpsertReaders(client.GetReadersAsync().Result);
         mirror.UpsertPeople(client.GetPersonsAsync().Result);
+        // Person dossier expands personId through dim_user_credentials, so
+        // the credentials dim has to be seeded before the join can resolve.
+        var credentials = client.GetUserCredentialsAsync().Result;
+        mirror.UpsertUserCredentials(credentials);
 
         var records = client.GetLogTransactionsAsync(DateTime.UtcNow.AddHours(-1)).Result;
         mirror.IngestTransactions(records);
         mirror.IngestAlarms(client.GetAlarmLogAsync(DateTime.UtcNow.AddHours(-1)).Result);
 
-        // Pick a person who actually has some traffic
-        var targetPersonId = records
+        // Pick the most-active credential, then resolve to its owning HostUserId.
+        var topCredentialId = records
+            .Where(r => r.Uid1 > 0)
             .GroupBy(r => r.Uid1)
             .OrderByDescending(g => g.Count())
             .First().Key;
+        var targetPersonId = (long)credentials.First(c => c.CredentialId == topCredentialId).PersonId;
+
+        // All credential ids that belong to this person — used to compute the
+        // expected event count. The dossier sums across every badge the
+        // person owns, not just the one badge we picked above.
+        var ownedCredentialIds = credentials
+            .Where(c => c.PersonId == targetPersonId)
+            .Select(c => c.CredentialId)
+            .ToHashSet();
 
         var dossier = mirror.GetPersonDossier(
             personId: targetPersonId,
@@ -510,11 +535,12 @@ public class EndToEndTests : IDisposable
         Assert.Equal(targetPersonId, dossier.PersonId);
         Assert.NotNull(dossier.PersonName);
 
-        // Summary totals align with filtered counts
-        var expectedEvents = records.Count(r => r.Uid1 == targetPersonId);
+        // Summary totals align with filtered counts: span every credential
+        // the person owns, not just the originally-picked one.
+        var expectedEvents = records.Count(r => ownedCredentialIds.Contains(r.Uid1));
         Assert.Equal(expectedEvents, dossier.Summary.TotalEvents);
 
-        var expectedDenials = records.Count(r => r.Uid1 == targetPersonId && r.Disposition > 1);
+        var expectedDenials = records.Count(r => ownedCredentialIds.Contains(r.Uid1) && r.Disposition > 1);
         Assert.Equal(expectedDenials, dossier.Summary.TotalDenials);
 
         Assert.NotNull(dossier.Summary.FirstSeen);
@@ -547,11 +573,19 @@ public class EndToEndTests : IDisposable
         mirror.UpsertDoors(client.GetDoorsAsync().Result);
         mirror.UpsertReaders(client.GetReadersAsync().Result);
         mirror.UpsertPeople(client.GetPersonsAsync().Result);
+        var credentials = client.GetUserCredentialsAsync().Result;
+        mirror.UpsertUserCredentials(credentials);
 
         var records = client.GetLogTransactionsAsync(DateTime.UtcNow.AddHours(-1)).Result;
         mirror.IngestTransactions(records);
 
-        var targetPersonId = records.First().Uid1;
+        // Pick a credential with traffic, resolve to its owning HostUserId.
+        var topCredentialId = records.Where(r => r.Uid1 > 0).First().Uid1;
+        var targetPersonId = (long)credentials.First(c => c.CredentialId == topCredentialId).PersonId;
+        var ownedCredentialIds = credentials
+            .Where(c => c.PersonId == targetPersonId)
+            .Select(c => c.CredentialId)
+            .ToHashSet();
 
         var dossier = mirror.GetPersonDossier(
             personId: targetPersonId,
@@ -561,9 +595,10 @@ public class EndToEndTests : IDisposable
             recentLimit: 0);
 
         // distinct_doors must not exceed 7 (total fake doors) and must not exceed
-        // the number of distinct readers this person touched (since doors collapse readers).
+        // the number of distinct readers this person touched (since doors collapse
+        // readers). The reader count spans every credential the person owns.
         Assert.True(dossier.Summary.DistinctDoors <= 7);
-        var distinctReaders = records.Where(r => r.Uid1 == targetPersonId)
+        var distinctReaders = records.Where(r => ownedCredentialIds.Contains(r.Uid1))
             .Select(r => r.ReaderName).Distinct().Count();
         Assert.True(dossier.Summary.DistinctDoors <= distinctReaders);
     }
@@ -893,8 +928,18 @@ public class EndToEndTests : IDisposable
         using var client = new FakeVelocityClient();
 
         mirror.UpsertPeople(client.GetPersonsAsync().Result);
+        // Daily attendance now rolls up through credentials → people, so the
+        // credentials dim must be seeded for the join to resolve any rows.
+        var credentials = client.GetUserCredentialsAsync().Result;
+        mirror.UpsertUserCredentials(credentials);
         var records = client.GetLogTransactionsAsync(DateTime.UtcNow.AddHours(-12)).Result;
         mirror.IngestTransactions(records);
+
+        // Reverse map: HostUserId → set of credential ids the person owns.
+        // Used to filter raw records by "who this row's PersonId represents".
+        var credentialsByPerson = credentials
+            .GroupBy(c => (long)c.PersonId)
+            .ToDictionary(g => g.Key, g => g.Select(c => c.CredentialId).ToHashSet());
 
         var since = DateTime.UtcNow.AddDays(-1);
         var until = DateTime.UtcNow.AddDays(1);
@@ -904,11 +949,18 @@ public class EndToEndTests : IDisposable
 
         Assert.NotEmpty(result.Rows);
 
-        // Hand-compute first/last per person over the day window for granted-only events
+        // Hand-compute first/last per person over the day window for granted-only events.
+        // row.PersonId is now a real HostUserId (positive) for matched credentials; we
+        // expand it back to its owning credential set for the raw-record filter.
         foreach (var row in result.Rows)
         {
+            // Skip orphan rows (negative PersonId) — fake client doesn't generate any
+            // since every fake credential maps to a fake person, but be defensive.
+            if (row.PersonId < 0) continue;
+
+            var ownedCredentialIds = credentialsByPerson[row.PersonId];
             var expected = records
-                .Where(r => r.Uid1 == row.PersonId
+                .Where(r => ownedCredentialIds.Contains(r.Uid1)
                             && r.Disposition == 1
                             && r.DtDate >= row.Day
                             && r.DtDate < row.Day.AddDays(1))
@@ -942,14 +994,24 @@ public class EndToEndTests : IDisposable
         using var client = new FakeVelocityClient();
 
         mirror.UpsertPeople(client.GetPersonsAsync().Result);
+        // GetDailyAttendance now joins through dim_user_credentials to roll up
+        // a person's badges into one daily row, so the credentials dim must
+        // be seeded before any person-scoped query will return data.
+        var credentials = client.GetUserCredentialsAsync().Result;
+        mirror.UpsertUserCredentials(credentials);
+
         var records = client.GetLogTransactionsAsync(DateTime.UtcNow.AddHours(-1)).Result;
         mirror.IngestTransactions(records);
 
-        var targetPersonId = (long)records
+        // Pick the most-active credential, then resolve it to its owning person.
+        // The personId filter expects a HostUserId (not a CredentialId), so the
+        // mapping has to happen here in the test.
+        var topCredentialId = records
             .Where(r => r.Disposition == 1 && r.Uid1 > 0)
             .GroupBy(r => r.Uid1)
             .OrderByDescending(g => g.Count())
             .First().Key;
+        var targetPersonId = (long)credentials.First(c => c.CredentialId == topCredentialId).PersonId;
 
         var result = mirror.GetDailyAttendance(
             since: DateTime.UtcNow.AddDays(-1),
@@ -958,6 +1020,10 @@ public class EndToEndTests : IDisposable
             limit: 10);
 
         Assert.NotEmpty(result.Rows);
+        // After the rollup, every returned row's PersonId is the real HostUserId
+        // for the filtered person. (For matched credentials this is positive;
+        // negative values would indicate orphan credentials, which we excluded
+        // by filtering on credentials we know are seeded.)
         Assert.All(result.Rows, r => Assert.Equal(targetPersonId, r.PersonId));
     }
 

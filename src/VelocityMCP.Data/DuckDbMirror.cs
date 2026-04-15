@@ -2294,18 +2294,36 @@ public sealed class DuckDbMirror : IDisposable
     public DailyAttendanceResult GetDailyAttendance(
         DateTime since, DateTime until, long? personId, int limit)
     {
-        var where = "WHERE dt_date >= $since AND dt_date < $until AND disposition = 1 AND uid1 > 0";
-        if (personId.HasValue) where += $" AND {PersonToUid1FilterFragment}";
+        // Roll up through credentials → people. A person with multiple
+        // badges should appear as ONE row per day, not one row per badge.
+        // Orphan credentials (uid1 not in dim_user_credentials) collapse
+        // under a synthetic "credential <id>" bucket via COALESCE so
+        // their activity is still surfaced rather than silently dropped.
+        var fromJoin = """
+            fact_transactions t
+            LEFT JOIN dim_user_credentials c ON c.credential_id = t.uid1
+            LEFT JOIN dim_people p ON p.person_id = c.person_id
+            """;
+
+        var where = "WHERE t.dt_date >= $since AND t.dt_date < $until AND t.disposition = 1 AND t.uid1 > 0";
+        if (personId.HasValue) where += " AND c.person_id = $pid";
+
+        // Composite group key: resolved persons collapse to "person:<id>",
+        // orphans stay split per credential as "cred:<id>". Same shape we
+        // use in AggregateTransactionsByPerson.
+        const string compositeGroupKey =
+            "COALESCE('person:' || CAST(c.person_id AS VARCHAR), 'cred:' || CAST(t.uid1 AS VARCHAR))";
 
         long totalRows;
         using (var cmd = _conn.CreateCommand())
         {
             cmd.CommandText = $"""
                 SELECT COUNT(*) FROM (
-                    SELECT uid1, DATE_TRUNC('day', dt_date) AS day
-                    FROM fact_transactions {where}
-                    GROUP BY uid1, day
-                ) AS t
+                    SELECT {compositeGroupKey} AS group_key,
+                           DATE_TRUNC('day', t.dt_date) AS day
+                    FROM {fromJoin} {where}
+                    GROUP BY group_key, day
+                ) AS s
                 """;
             cmd.Parameters.Add(new DuckDBParameter("since", since));
             cmd.Parameters.Add(new DuckDBParameter("until", until));
@@ -2316,15 +2334,21 @@ public sealed class DuckDbMirror : IDisposable
         var rows = new List<DailyAttendanceRow>();
         using (var cmd = _conn.CreateCommand())
         {
+            // PersonId in the result is the real HostUserId for matched rows.
+            // For orphan credentials we report the credential id (negated to
+            // distinguish from real person ids) — this is the only branch where
+            // PersonId might NOT be a HostUserId, and only for orphans we have
+            // no other id to report.
             cmd.CommandText = $"""
-                SELECT uid1,
-                       ANY_VALUE(uid1_name) AS person_name,
-                       DATE_TRUNC('day', dt_date) AS day,
-                       MIN(dt_date) AS first_seen,
-                       MAX(dt_date) AS last_seen,
-                       COUNT(*) AS event_count
-                FROM fact_transactions {where}
-                GROUP BY uid1, day
+                SELECT
+                    COALESCE(MAX(c.person_id), -MAX(t.uid1)) AS person_id,
+                    COALESCE(MAX(p.full_name), MAX(t.uid1_name), 'Unknown credential ' || CAST(MAX(t.uid1) AS VARCHAR)) AS person_name,
+                    DATE_TRUNC('day', t.dt_date) AS day,
+                    MIN(t.dt_date) AS first_seen,
+                    MAX(t.dt_date) AS last_seen,
+                    COUNT(*) AS event_count
+                FROM {fromJoin} {where}
+                GROUP BY {compositeGroupKey}, DATE_TRUNC('day', t.dt_date)
                 ORDER BY day DESC, last_seen DESC
                 LIMIT $limit
                 """;

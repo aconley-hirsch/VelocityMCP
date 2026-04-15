@@ -8,6 +8,11 @@
     <PackageReference Include="ModelContextProtocol" Version="1.2.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Test project needs to call internal helpers like TimeWindow.Resolve. -->
+    <InternalsVisibleTo Include="VelocityMCP.Tests" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
